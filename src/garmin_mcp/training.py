@@ -2,10 +2,20 @@
 Training and performance functions for Garmin Connect MCP Server
 """
 import datetime
+import json
 from typing import Any, Dict, List, Optional, Union
 
 # The garmin_client will be set by the main file
 garmin_client = None
+
+
+def _to_json_str(data):
+    if isinstance(data, str):
+        return data
+    try:
+        return json.dumps(data, indent=2, default=str)
+    except (TypeError, ValueError):
+        return str(data)
 
 
 def configure(client):
@@ -34,7 +44,7 @@ def register_tools(app):
             )
             if not summary:
                 return f"No progress summary found for {metric} between {start_date} and {end_date}."
-            return summary
+            return _to_json_str(summary)
         except Exception as e:
             return f"Error retrieving progress summary: {str(e)}"
     
@@ -50,7 +60,7 @@ def register_tools(app):
             hill_score = garmin_client.get_hill_score(start_date, end_date)
             if not hill_score:
                 return f"No hill score data found between {start_date} and {end_date}."
-            return hill_score
+            return _to_json_str(hill_score)
         except Exception as e:
             return f"Error retrieving hill score data: {str(e)}"
     
@@ -66,7 +76,7 @@ def register_tools(app):
             endurance_score = garmin_client.get_endurance_score(start_date, end_date)
             if not endurance_score:
                 return f"No endurance score data found between {start_date} and {end_date}."
-            return endurance_score
+            return _to_json_str(endurance_score)
         except Exception as e:
             return f"Error retrieving endurance score data: {str(e)}"
     
@@ -81,7 +91,7 @@ def register_tools(app):
             effect = garmin_client.get_training_effect(activity_id)
             if not effect:
                 return f"No training effect data found for activity with ID {activity_id}."
-            return effect
+            return _to_json_str(effect)
         except Exception as e:
             return f"Error retrieving training effect data: {str(e)}"
     
@@ -96,7 +106,7 @@ def register_tools(app):
             metrics = garmin_client.get_max_metrics(date)
             if not metrics:
                 return f"No max metrics data found for {date}."
-            return metrics
+            return _to_json_str(metrics)
         except Exception as e:
             return f"Error retrieving max metrics data: {str(e)}"
     
@@ -111,7 +121,7 @@ def register_tools(app):
             hrv_data = garmin_client.get_hrv_data(date)
             if not hrv_data:
                 return f"No HRV data found for {date}."
-            return hrv_data
+            return _to_json_str(hrv_data)
         except Exception as e:
             return f"Error retrieving HRV data: {str(e)}"
     
@@ -126,7 +136,7 @@ def register_tools(app):
             fitness_age = garmin_client.get_fitnessage_data(date)
             if not fitness_age:
                 return f"No fitness age data found for {date}."
-            return fitness_age
+            return _to_json_str(fitness_age)
         except Exception as e:
             return f"Error retrieving fitness age data: {str(e)}"
     
@@ -139,7 +149,7 @@ def register_tools(app):
         """
         try:
             result = garmin_client.request_reload(date)
-            return result
+            return _to_json_str(result)
         except Exception as e:
             return f"Error requesting data reload: {str(e)}"
 
