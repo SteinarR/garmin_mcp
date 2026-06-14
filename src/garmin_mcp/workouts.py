@@ -2,10 +2,21 @@
 Workout-related functions for Garmin Connect MCP Server
 """
 import datetime
+import json
 from typing import Any, Dict, List, Optional, Union
 
 # The garmin_client will be set by the main file
 garmin_client = None
+
+
+def _to_json_str(data):
+    """Convert data to JSON string if it's not already a string"""
+    if isinstance(data, str):
+        return data
+    try:
+        return json.dumps(data, indent=2, default=str)
+    except (TypeError, ValueError):
+        return str(data)
 
 
 def configure(client):
@@ -24,7 +35,7 @@ def register_tools(app):
             workouts = garmin_client.get_workouts()
             if not workouts:
                 return "No workouts found."
-            return workouts
+            return _to_json_str(workouts)
         except Exception as e:
             return f"Error retrieving workouts: {str(e)}"
     
@@ -39,7 +50,7 @@ def register_tools(app):
             workout = garmin_client.get_workout_by_id(workout_id)
             if not workout:
                 return f"No workout found with ID {workout_id}."
-            return workout
+            return _to_json_str(workout)
         except Exception as e:
             return f"Error retrieving workout: {str(e)}"
     
@@ -69,7 +80,7 @@ def register_tools(app):
         """
         try:
             result = garmin_client.upload_workout(workout_json)
-            return result
+            return _to_json_str(result)
         except Exception as e:
             return f"Error uploading workout: {str(e)}"
             

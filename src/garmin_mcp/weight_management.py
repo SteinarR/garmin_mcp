@@ -2,10 +2,21 @@
 Weight management functions for Garmin Connect MCP Server
 """
 import datetime
+import json
 from typing import Any, Dict, List, Optional, Union
 
 # The garmin_client will be set by the main file
 garmin_client = None
+
+
+def _to_json_str(data):
+    """Convert data to JSON string if it's not already a string"""
+    if isinstance(data, str):
+        return data
+    try:
+        return json.dumps(data, indent=2, default=str)
+    except (TypeError, ValueError):
+        return str(data)
 
 
 def configure(client):
@@ -29,7 +40,7 @@ def register_tools(app):
             weigh_ins = garmin_client.get_weigh_ins(start_date, end_date)
             if not weigh_ins:
                 return f"No weight measurements found between {start_date} and {end_date}."
-            return weigh_ins
+            return _to_json_str(weigh_ins)
         except Exception as e:
             return f"Error retrieving weight measurements: {str(e)}"
 
@@ -44,7 +55,7 @@ def register_tools(app):
             weigh_ins = garmin_client.get_daily_weigh_ins(date)
             if not weigh_ins:
                 return f"No weight measurements found for {date}."
-            return weigh_ins
+            return _to_json_str(weigh_ins)
         except Exception as e:
             return f"Error retrieving daily weight measurements: {str(e)}"
     
@@ -58,7 +69,7 @@ def register_tools(app):
         """
         try:
             result = garmin_client.delete_weigh_ins(date, delete_all=delete_all)
-            return result
+            return _to_json_str(result)
         except Exception as e:
             return f"Error deleting weight measurements: {str(e)}"
     
@@ -72,7 +83,7 @@ def register_tools(app):
         """
         try:
             result = garmin_client.add_weigh_in(weight=weight, unitKey=unit_key)
-            return result
+            return _to_json_str(result)
         except Exception as e:
             return f"Error adding weight measurement: {str(e)}"
     
@@ -104,7 +115,7 @@ def register_tools(app):
                 dateTimestamp=date_timestamp,
                 gmtTimestamp=gmt_timestamp
             )
-            return result
+            return _to_json_str(result)
         except Exception as e:
             return f"Error adding weight measurement with timestamps: {str(e)}"
 

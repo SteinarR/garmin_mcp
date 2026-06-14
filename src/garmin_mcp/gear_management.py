@@ -2,10 +2,21 @@
 Gear management functions for Garmin Connect MCP Server
 """
 import datetime
+import json
 from typing import Any, Dict, List, Optional, Union
 
 # The garmin_client will be set by the main file
 garmin_client = None
+
+
+def _to_json_str(data):
+    """Convert data to JSON string if it's not already a string"""
+    if isinstance(data, str):
+        return data
+    try:
+        return json.dumps(data, indent=2, default=str)
+    except (TypeError, ValueError):
+        return str(data)
 
 
 def configure(client):
@@ -28,7 +39,7 @@ def register_tools(app):
             gear = garmin_client.get_gear(user_profile_id)
             if not gear:
                 return "No gear found."
-            return gear
+            return _to_json_str(gear)
         except Exception as e:
             return f"Error retrieving gear: {str(e)}"
 
@@ -43,7 +54,7 @@ def register_tools(app):
             defaults = garmin_client.get_gear_defaults(user_profile_id)
             if not defaults:
                 return "No gear defaults found."
-            return defaults
+            return _to_json_str(defaults)
         except Exception as e:
             return f"Error retrieving gear defaults: {str(e)}"
     
@@ -58,7 +69,7 @@ def register_tools(app):
             stats = garmin_client.get_gear_stats(gear_uuid)
             if not stats:
                 return f"No stats found for gear with UUID {gear_uuid}."
-            return stats
+            return _to_json_str(stats)
         except Exception as e:
             return f"Error retrieving gear stats: {str(e)}"
 
