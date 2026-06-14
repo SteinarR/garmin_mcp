@@ -2,10 +2,21 @@
 Challenges and badges functions for Garmin Connect MCP Server
 """
 import datetime
+import json
 from typing import Any, Dict, List, Optional, Union
 
 # The garmin_client will be set by the main file
 garmin_client = None
+
+
+def _to_json_str(data):
+    """Convert data to JSON string if it's not already a string"""
+    if isinstance(data, str):
+        return data
+    try:
+        return json.dumps(data, indent=2, default=str)
+    except (TypeError, ValueError):
+        return str(data)
 
 
 def configure(client):
@@ -28,7 +39,7 @@ def register_tools(app):
             goals = garmin_client.get_goals(goal_type)
             if not goals:
                 return f"No {goal_type} goals found."
-            return goals
+            return _to_json_str(goals)
         except Exception as e:
             return f"Error retrieving {goal_type} goals: {str(e)}"
 
@@ -39,7 +50,7 @@ def register_tools(app):
             records = garmin_client.get_personal_record()
             if not records:
                 return "No personal records found."
-            return records
+            return _to_json_str(records)
         except Exception as e:
             return f"Error retrieving personal records: {str(e)}"
 
@@ -50,7 +61,7 @@ def register_tools(app):
             badges = garmin_client.get_earned_badges()
             if not badges:
                 return "No earned badges found."
-            return badges
+            return _to_json_str(badges)
         except Exception as e:
             return f"Error retrieving earned badges: {str(e)}"
 
@@ -66,7 +77,7 @@ def register_tools(app):
             challenges = garmin_client.get_adhoc_challenges(start, limit)
             if not challenges:
                 return "No adhoc challenges found."
-            return challenges
+            return _to_json_str(challenges)
         except Exception as e:
             return f"Error retrieving adhoc challenges: {str(e)}"
 
@@ -82,7 +93,7 @@ def register_tools(app):
             challenges = garmin_client.get_available_badge_challenges(start, limit)
             if not challenges:
                 return "No available badge challenges found."
-            return challenges
+            return _to_json_str(challenges)
         except Exception as e:
             return f"Error retrieving available badge challenges: {str(e)}"
 
@@ -98,7 +109,7 @@ def register_tools(app):
             challenges = garmin_client.get_badge_challenges(start, limit)
             if not challenges:
                 return "No badge challenges found."
-            return challenges
+            return _to_json_str(challenges)
         except Exception as e:
             return f"Error retrieving badge challenges: {str(e)}"
 
@@ -114,7 +125,7 @@ def register_tools(app):
             challenges = garmin_client.get_non_completed_badge_challenges(start, limit)
             if not challenges:
                 return "No non-completed badge challenges found."
-            return challenges
+            return _to_json_str(challenges)
         except Exception as e:
             return f"Error retrieving non-completed badge challenges: {str(e)}"
 
@@ -125,7 +136,7 @@ def register_tools(app):
             predictions = garmin_client.get_race_predictions()
             if not predictions:
                 return "No race predictions found."
-            return predictions
+            return _to_json_str(predictions)
         except Exception as e:
             return f"Error retrieving race predictions: {str(e)}"
 
@@ -143,7 +154,7 @@ def register_tools(app):
             )
             if not challenges:
                 return f"No in-progress virtual challenges found between {start_date} and {end_date}."
-            return challenges
+            return _to_json_str(challenges)
         except Exception as e:
             return f"Error retrieving in-progress virtual challenges: {str(e)}"
 
