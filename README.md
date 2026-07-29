@@ -470,6 +470,17 @@ With both tiers enabled and the ingestor's `daily_wellness` category on, a
 `body_battery`) is served entirely from disk for settled dates, down from 5
 Garmin calls per day of range to zero.
 
+### Known coverage limits
+
+Raw retention on the ingestor was originally 30 days and was later raised to
+730. Payloads deleted under the old policy are gone from disk.
+
+As of 2026-07-29 this affects activities: 69 of 98 indexed activities have no
+raw file, so `get_activities_by_date` falls back to the live API for any range
+that includes them. The cost is low — that call fetches a whole range in one
+request, unlike the per-day endpoints where each missing date costs its own
+call. Sleep has no gaps.
+
 ### Freshness
 
 Dates newer than `GARMIN_CACHE_MIN_AGE_DAYS` always go to the live API, because
