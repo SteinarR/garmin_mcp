@@ -2,10 +2,21 @@
 Women's health functions for Garmin Connect MCP Server
 """
 import datetime
+import json
 from typing import Any, Dict, List, Optional, Union
 
 # The garmin_client will be set by the main file
 garmin_client = None
+
+
+def _to_json_str(data):
+    """Convert data to JSON string if it's not already a string"""
+    if isinstance(data, str):
+        return data
+    try:
+        return json.dumps(data, indent=2, default=str)
+    except (TypeError, ValueError):
+        return str(data)
 
 
 def configure(client):
@@ -24,7 +35,7 @@ def register_tools(app):
             summary = garmin_client.get_pregnancy_summary()
             if not summary:
                 return "No pregnancy summary data found."
-            return summary
+            return _to_json_str(summary)
         except Exception as e:
             return f"Error retrieving pregnancy summary: {str(e)}"
     
@@ -39,7 +50,7 @@ def register_tools(app):
             data = garmin_client.get_menstrual_data_for_date(date)
             if not data:
                 return f"No menstrual data found for {date}."
-            return data
+            return _to_json_str(data)
         except Exception as e:
             return f"Error retrieving menstrual data: {str(e)}"
     
@@ -55,7 +66,7 @@ def register_tools(app):
             data = garmin_client.get_menstrual_calendar_data(start_date, end_date)
             if not data:
                 return f"No menstrual calendar data found between {start_date} and {end_date}."
-            return data
+            return _to_json_str(data)
         except Exception as e:
             return f"Error retrieving menstrual calendar data: {str(e)}"
 

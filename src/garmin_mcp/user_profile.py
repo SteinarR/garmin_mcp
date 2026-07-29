@@ -2,10 +2,21 @@
 User Profile functions for Garmin Connect MCP Server
 """
 import datetime
+import json
 from typing import Any, Dict, List, Optional, Union
 
 # The garmin_client will be set by the main file
 garmin_client = None
+
+
+def _to_json_str(data):
+    """Convert data to JSON string if it's not already a string"""
+    if isinstance(data, str):
+        return data
+    try:
+        return json.dumps(data, indent=2, default=str)
+    except (TypeError, ValueError):
+        return str(data)
 
 
 def configure(client):
@@ -22,7 +33,7 @@ def register_tools(app):
         """Get user's full name from profile"""
         try:
             full_name = garmin_client.get_full_name()
-            return full_name
+            return _to_json_str(full_name)
         except Exception as e:
             return f"Error retrieving user's full name: {str(e)}"
 
@@ -31,7 +42,7 @@ def register_tools(app):
         """Get user's preferred unit system from profile"""
         try:
             unit_system = garmin_client.get_unit_system()
-            return unit_system
+            return _to_json_str(unit_system)
         except Exception as e:
             return f"Error retrieving unit system: {str(e)}"
     
@@ -42,7 +53,7 @@ def register_tools(app):
             profile = garmin_client.get_user_profile()
             if not profile:
                 return "No user profile information found."
-            return profile
+            return _to_json_str(profile)
         except Exception as e:
             return f"Error retrieving user profile: {str(e)}"
 
@@ -53,7 +64,7 @@ def register_tools(app):
             settings = garmin_client.get_userprofile_settings()
             if not settings:
                 return "No user profile settings found."
-            return settings
+            return _to_json_str(settings)
         except Exception as e:
             return f"Error retrieving user profile settings: {str(e)}"
 
