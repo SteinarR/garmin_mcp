@@ -434,7 +434,13 @@ Garmin returned, so tools cannot tell the difference:
 | Call | Source |
 |------|--------|
 | `get_sleep_data(date)` | `raw/sleep/{date}.json` |
+| `get_stats(date)` | `raw/stats/{date}.json` |
+| `get_body_battery(date, date)` | `raw/body_battery/{date}.json` |
 | `get_activities_by_date(start, end)` | SQLite `start_time` index + `raw/activities/{id}.json` |
+
+`get_stats` and `get_body_battery` require the ingestor's `daily_wellness`
+category (`GARMIN_ENABLE_DAILY_WELLNESS=true`), which is off by default there.
+Only the single-day `get_body_battery` form is cached; wider ranges stay live.
 
 **Derived** (`GARMIN_CACHE_DERIVED`) — the ingestor normalizes these, so the
 response carries only the retained fields and is tagged `"_partial": true`:
@@ -447,9 +453,14 @@ response carries only the retained fields and is tagged `"_partial": true`:
 | `get_training_status(date)` | `raw/daily_training_state/` | status code, acute/chronic load |
 | `get_body_composition(date)` | `raw/body_metrics/` | weight, muscle mass, body fat |
 
-Everything else — `get_stats`, `get_body_battery`, `get_stress_data`,
-`get_max_metrics`, `get_activities`, and every write method — passes straight
-through to the live client.
+Everything else — `get_stress_data`, `get_max_metrics`, `get_heart_rates`,
+`get_activities`, and every write method — passes straight through to the live
+client.
+
+With both tiers enabled and the ingestor's `daily_wellness` category on, a
+`get_trends` call over its default metric set (`rhr`, `hrv`, `sleep`, `steps`,
+`body_battery`) is served entirely from disk for settled dates, down from 5
+Garmin calls per day of range to zero.
 
 ### Freshness
 

@@ -125,6 +125,16 @@ class GarminCache:
         payload = self.read_raw("sleep", day.isoformat())
         return payload if isinstance(payload, dict) else None
 
+    def get_stats(self, day):
+        """Exact: the ingestor stores the unmodified get_stats payload."""
+        payload = self.read_raw("stats", day.isoformat())
+        return payload if isinstance(payload, dict) else None
+
+    def get_body_battery(self, day):
+        """Exact: stored from get_body_battery(day, day), so single-day only."""
+        payload = self.read_raw("body_battery", day.isoformat())
+        return payload if isinstance(payload, list) else None
+
     def get_activities_by_date(self, start, end, activity_type=None):
         """Exact per activity: look up ids in SQLite, then read each raw payload."""
         rows = self._query(

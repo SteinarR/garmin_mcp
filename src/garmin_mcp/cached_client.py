@@ -23,7 +23,12 @@ from garmin_mcp.cache import GarminCache, _as_date
 
 # Payloads stored verbatim by the ingestor; tools cannot distinguish these from
 # a live response.
-EXACT_METHODS = ("get_sleep_data", "get_activities_by_date")
+EXACT_METHODS = (
+    "get_sleep_data",
+    "get_activities_by_date",
+    "get_stats",
+    "get_body_battery",
+)
 
 # Payloads the ingestor normalized or canonicalized; the reconstruction carries
 # only the retained fields and is marked with `_partial`.
@@ -107,6 +112,26 @@ class CachedGarminClient:
             if cached is not None:
                 return cached
         return self._client.get_sleep_data(cdate, *args, **kwargs)
+
+    def get_stats(self, cdate, *args, **kwargs):
+        if not args and not kwargs:
+            cached = self._serve("get_stats", cdate, self._cache.get_stats)
+            if cached is not None:
+                return cached
+        return self._client.get_stats(cdate, *args, **kwargs)
+
+    def get_body_battery(self, startdate, enddate=None, *args, **kwargs):
+        # The ingestor stores the single-day response, so only the (d, d) and
+        # (d) forms can be served; wider ranges stay live.
+        if not args and not kwargs and (enddate is None or enddate == startdate):
+            cached = self._serve(
+                "get_body_battery", startdate, self._cache.get_body_battery
+            )
+            if cached is not None:
+                return cached
+        if enddate is None:
+            return self._client.get_body_battery(startdate, *args, **kwargs)
+        return self._client.get_body_battery(startdate, enddate, *args, **kwargs)
 
     def get_activities_by_date(self, startdate, enddate, activitytype=None, *args, **kwargs):
         if not args and not kwargs:

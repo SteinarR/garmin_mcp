@@ -51,8 +51,14 @@ class FakeClient:
     def get_body_composition(self, s, e=None, *a, **k):
         return self._record("get_body_composition", s, e, *a, **k)
 
-    def get_stats(self, cdate):
-        return self._record("get_stats", cdate)
+    def get_stats(self, cdate, *a, **k):
+        return self._record("get_stats", cdate, *a, **k)
+
+    def get_body_battery(self, s, e=None, *a, **k):
+        return self._record("get_body_battery", s, e, *a, **k)
+
+    def get_max_metrics(self, cdate):
+        return self._record("get_max_metrics", cdate)
 
     def add_weigh_in(self, weight):
         return self._record("add_weigh_in", weight)
@@ -101,6 +107,14 @@ def data_dir(tmp_path):
             "muscleMassKg": 35.0,
             "bodyFatPercent": 18.2,
         },
+    )
+    _write(
+        root / "raw" / "stats" / f"{day}.json",
+        {"calendarDate": day, "totalSteps": 11542, "restingHeartRate": 47},
+    )
+    _write(
+        root / "raw" / "body_battery" / f"{day}.json",
+        [{"date": day, "bodyBatteryValuesArray": [[0, "MEASURED", 55, 1.0]]}],
     )
     _write(
         root / "raw" / "activities" / "111.json",
@@ -264,10 +278,32 @@ def test_derived_disabled_by_default(data_dir, db_path):
 # -- passthrough ----------------------------------------------------------
 
 
+def test_stats_served_from_cache_verbatim(client):
+    cached, live = client
+    result = cached.get_stats(SETTLED.isoformat())
+    assert result["totalSteps"] == 11542
+    assert "_source" not in result
+    assert live.calls == []
+
+
+def test_body_battery_single_day_served_from_cache(client):
+    cached, live = client
+    result = cached.get_body_battery(SETTLED.isoformat(), SETTLED.isoformat())
+    assert result[0]["bodyBatteryValuesArray"][0][2] == 55
+    assert live.calls == []
+
+
+def test_body_battery_range_stays_live(client):
+    cached, live = client
+    earlier = (SETTLED - datetime.timedelta(days=3)).isoformat()
+    cached.get_body_battery(earlier, SETTLED.isoformat())
+    assert live.calls[0][0] == "get_body_battery"
+
+
 def test_uncached_read_passes_through(client):
     cached, live = client
-    cached.get_stats(SETTLED.isoformat())
-    assert live.calls[0][0] == "get_stats"
+    cached.get_max_metrics(SETTLED.isoformat())
+    assert live.calls[0][0] == "get_max_metrics"
 
 
 def test_write_methods_pass_through(client):
