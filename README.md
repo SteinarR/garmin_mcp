@@ -425,10 +425,20 @@ volumes:
 
 The context DB directory must be mounted **read-write** even though this server
 only ever reads it. The ingestor runs SQLite in WAL mode, and opening a WAL
-database requires creating a `-shm` file in its directory; on a read-only mount
-that fails and activity range caching silently degrades to live API calls. The
-connection itself is opened with `mode=ro`, so this server still cannot write to
-the database. The data directory is genuinely read-only and should stay `:ro`.
+database requires a `-shm` file alongside it; if that file has to be created and
+the mount is read-only, the open fails and activity range caching silently
+degrades to live API calls. The connection itself is opened with `mode=ro`, so
+this server still cannot write to the database. The data directory is genuinely
+read-only and should stay `:ro`.
+
+A read-only mount may appear to work when tested, which makes this easy to get
+wrong. SQLite keeps `-wal` and `-shm` on disk only while at least one connection
+is open, and deletes them when the last one closes. On the current server a
+long-running API container holds a connection permanently, so the files are
+always present and a read-only mount can reuse them. Stop that container while
+nothing else is connected and the files disappear — after which a read-only
+mount cannot recreate them. Testing the mount proves nothing about the state you
+will eventually be in.
 
 The cache is **read-through and fail-open**: a miss, an unrecognized argument
 shape, or any cache error falls back to the live API. It is disabled unless
@@ -480,6 +490,27 @@ raw file, so `get_activities_by_date` falls back to the live API for any range
 that includes them. The cost is low — that call fetches a whole range in one
 request, unlike the per-day endpoints where each missing date costs its own
 call. Sleep has no gaps.
+
+Three calls in the per-day loops are still uncached because the ingestor does
+not collect them: `get_stress_data`, `get_max_metrics` and `get_heart_rates`.
+Covering them would need another ingestion category on the personal-ai side, at
+further API-call cost there.
+
+`get_activities` (most-recent-N) is deliberately never cached. It exists to
+return the newest activities, which is exactly the data a periodically-synced
+cache cannot be trusted for.
+
+### Unbounded date ranges
+
+Independent of the cache: the range tools in `recommendations.py` —
+`get_trends`, `detect_anomalies`, `get_optimized_health_data`,
+`get_period_summary`, `get_coach_cues` — accept an arbitrary date range and loop
+day by day with no upper limit. Every uncached metric costs one API call per day
+of range, so a single 365-day request can issue well over a thousand calls
+against a ~90-100/day budget.
+
+The cache reduces this sharply where it has coverage, but it is not a limit. A
+sanity cap on range length would be worth adding on its own merits.
 
 ### Freshness
 
