@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Environments
+.venv/
+.env
+.env.*
+
+# Tokens/cache
+**/.garminconnect/
+**/.garminconnect_base64
+
+# Editor/OS
+.DS_Store
+.idea/
+.vscode/

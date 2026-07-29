@@ -19,5 +19,15 @@ dependencies = [
 [project.scripts]
 garmin-mcp = "garmin_mcp:main"
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+# test_garmin.py and test_mcp_debug.py are manual scripts that need live Garmin
+# credentials; only the offline suites run by default.
+addopts = "--ignore=tests/test_garmin.py --ignore=tests/test_mcp_debug.py --ignore=test_mcp_server.py"
+
 [tool.uv.sources]
 garmin-mcp = { workspace = true }

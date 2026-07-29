@@ -34,6 +34,7 @@ from garmin_mcp import workouts
 from garmin_mcp import data_management
 from garmin_mcp import womens_health
 from garmin_mcp import recommendations
+from garmin_mcp.cached_client import build_cached_client
 
 def get_mfa() -> str:
     """Get MFA code non-interactively for container/Kubernetes environments.
@@ -150,6 +151,11 @@ def main():
         return
 
     print("Garmin Connect client initialized successfully.")
+
+    # Optionally wrap the client so settled reads are served from the
+    # garmin-ingestor output instead of the Garmin API. No-op unless
+    # GARMIN_CACHE_ENABLED is set.
+    garmin_client = build_cached_client(garmin_client)
 
     # Configure all modules with the Garmin client
     activity_management.configure(garmin_client)

@@ -386,8 +386,79 @@ kubectl apply -f httproute.yaml
 | `GARMIN_MCP_TRANSPORT` | Transport type: `stdio` or `streamable-http` | `http` | No |
 | `GARMIN_MCP_HOST` | Bind host for HTTP transport | `0.0.0.0` | No |
 | `GARMIN_MCP_PORT` | Port for HTTP transport | `8000` | No |
+| `GARMIN_CACHE_ENABLED` | Serve settled reads from ingested data | `false` | No |
+| `GARMIN_CACHE_DIR` | garmin-ingestor data directory | `/data/garmin` | No |
+| `GARMIN_CACHE_DB` | Context SQLite DB (needed for activity ranges) | - | No |
+| `GARMIN_CACHE_MIN_AGE_DAYS` | Freshness floor; newer dates always go live | `1` | No |
+| `GARMIN_CACHE_DERIVED` | Also serve lossy derived payloads | `false` | No |
+| `GARMIN_CACHE_VERBOSE` | Log every cache hit/miss | `false` | No |
 
 *Required only if MFA is enabled on your Garmin Connect account, and only on first run or when tokens expire
+
+## Ingested Data Cache
+
+Garmin Connect tolerates roughly 90-100 API calls per day. Tools that loop over a
+date range (`get_trends`, `detect_anomalies`, `get_optimized_health_data`,
+`get_period_summary`, `get_coach_cues`) spend 5-7 calls *per day of range*, so a
+90-day trend query alone can exhaust the budget several times over.
+
+If this server runs alongside a
+[garmin-ingestor](https://github.com/steinarr/personal-ai) deployment, it can
+read that data instead of calling Garmin. The ingestor already persists raw
+payloads (730-day retention) and a SQLite index on a 6-hourly cron.
+
+Enable it by mounting the ingestor's volumes read-only and setting:
+
+```bash
+GARMIN_CACHE_ENABLED=true
+GARMIN_CACHE_DIR=/data/garmin
+GARMIN_CACHE_DB=/context-db/context_kernel.db
+GARMIN_CACHE_DERIVED=true
+```
+
+```yaml
+volumes:
+  - /srv/dev/garmin:/data/garmin:ro
+  - /var/lib/personal-ai/dev:/context-db:ro
+```
+
+The cache is **read-through and fail-open**: a miss, an unrecognized argument
+shape, or any cache error falls back to the live API. It is disabled unless
+`GARMIN_CACHE_ENABLED` is set, so existing deployments are unaffected.
+
+### Fidelity tiers
+
+**Exact** (`GARMIN_CACHE_ENABLED`) — the stored payload is byte-identical to what
+Garmin returned, so tools cannot tell the difference:
+
+| Call | Source |
+|------|--------|
+| `get_sleep_data(date)` | `raw/sleep/{date}.json` |
+| `get_activities_by_date(start, end)` | SQLite `start_time` index + `raw/activities/{id}.json` |
+
+**Derived** (`GARMIN_CACHE_DERIVED`) — the ingestor normalizes these, so the
+response carries only the retained fields and is tagged `"_partial": true`:
+
+| Call | Source | Retained |
+|------|--------|----------|
+| `get_rhr_day(date)` | raw sleep | `restingHeartRate` |
+| `get_hrv_data(date)` | raw sleep | `avgOvernightHrv`, `hrvStatus`, `hrvData` |
+| `get_training_readiness(date)` | `raw/daily_training_state/` | readiness score |
+| `get_training_status(date)` | `raw/daily_training_state/` | status code, acute/chronic load |
+| `get_body_composition(date)` | `raw/body_metrics/` | weight, muscle mass, body fat |
+
+Everything else — `get_stats`, `get_body_battery`, `get_stress_data`,
+`get_max_metrics`, `get_activities`, and every write method — passes straight
+through to the live client.
+
+### Freshness
+
+Dates newer than `GARMIN_CACHE_MIN_AGE_DAYS` always go to the live API, because
+the ingestor runs on a 6-hourly cron and Garmin keeps revising recent days.
+Training status and readiness use a stricter 2-day floor to match the ingestor's
+own recompute window. `get_activities_by_date` is only served from cache when the
+*entire* range is settled, so a partially-ingested window can never silently drop
+an activity.
 
 ## Token Management
 
