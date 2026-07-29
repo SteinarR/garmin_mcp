@@ -419,8 +419,16 @@ GARMIN_CACHE_DERIVED=true
 ```yaml
 volumes:
   - /srv/dev/garmin:/data/garmin:ro
-  - /var/lib/personal-ai/dev:/context-db:ro
+  # Not :ro — see below.
+  - /var/lib/personal-ai/dev:/context-db
 ```
+
+The context DB directory must be mounted **read-write** even though this server
+only ever reads it. The ingestor runs SQLite in WAL mode, and opening a WAL
+database requires creating a `-shm` file in its directory; on a read-only mount
+that fails and activity range caching silently degrades to live API calls. The
+connection itself is opened with `mode=ro`, so this server still cannot write to
+the database. The data directory is genuinely read-only and should stay `:ro`.
 
 The cache is **read-through and fail-open**: a miss, an unrecognized argument
 shape, or any cache error falls back to the live API. It is disabled unless

@@ -105,7 +105,10 @@ class GarminCache:
         conn = None
         try:
             # mode=ro guarantees this process can never write to the DB the
-            # ingestor owns; WAL lets us read while a sync is in flight.
+            # ingestor owns; WAL lets us read while a sync is in flight. Note
+            # that WAL still needs to create a -shm file next to the database,
+            # so the containing directory must be mounted read-write even
+            # though this connection is read-only.
             conn = sqlite3.connect(
                 f"file:{self.db_path}?mode=ro", uri=True, timeout=5.0
             )
