@@ -391,7 +391,7 @@ kubectl apply -f httproute.yaml
 | `GARMIN_CACHE_DB` | Context SQLite DB (needed for activity ranges) | - | No |
 | `GARMIN_CACHE_MIN_AGE_DAYS` | Freshness floor; newer dates always go live | `1` | No |
 | `GARMIN_CACHE_DERIVED` | Also serve lossy derived payloads | `false` | No |
-| `GARMIN_CACHE_VERBOSE` | Log every cache hit/miss | `false` | No |
+| `GARMIN_CACHE_VERBOSE` | Log every cache decision | `false` | No |
 
 *Required only if MFA is enabled on your Garmin Connect account, and only on first run or when tokens expire
 
@@ -499,6 +499,26 @@ further API-call cost there.
 `get_activities` (most-recent-N) is deliberately never cached. It exists to
 return the newest activities, which is exactly the data a periodically-synced
 cache cannot be trusted for.
+
+### Reading the verbose log
+
+`GARMIN_CACHE_VERBOSE=true` emits one `[garmin-cache]` line for every decision,
+so a call that reaches the cache never passes without a trace:
+
+| Line | Meaning |
+|------|---------|
+| `hit` | Served from disk. No Garmin call. |
+| `miss` | Old enough to serve, but no stored payload. Fell back to the API. |
+| `skip` | Newer than the freshness floor, so the API was used deliberately. **Not a fault.** |
+| `bypass` | Argument shape the cache does not handle (a date range, an unparseable date). |
+
+A run with only `skip` lines is a cache working as designed against recent
+dates, not a broken one — to see hits, request a date older than
+`GARMIN_CACHE_MIN_AGE_DAYS` (or older than 2 days for training status and
+readiness, which use a stricter floor).
+
+Leave this off in normal operation. It is per-call, and container logs are
+usually size-capped.
 
 ### Unbounded date ranges
 

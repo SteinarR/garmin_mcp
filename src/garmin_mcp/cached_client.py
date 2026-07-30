@@ -86,9 +86,14 @@ class CachedGarminClient:
             return None
         parsed = _as_date(day)
         if parsed is None:
+            self._log(f"{method} {day!r} bypass (unparseable date)")
             return None
         if not self._cache.is_cacheable_date(parsed, min_age_days=min_age_days):
+            # Logged, not silent: a skip is correct behavior for a recent date,
+            # and without a line for it there is no way to tell a working cache
+            # from a broken one.
             self._cache._count("skip")
+            self._log(f"{method} {parsed} skip (newer than freshness floor)")
             return None
         try:
             result = loader(parsed)
@@ -129,6 +134,10 @@ class CachedGarminClient:
             )
             if cached is not None:
                 return cached
+        elif enddate is not None:
+            self._log(
+                f"get_body_battery {startdate}..{enddate} bypass (multi-day range)"
+            )
         if enddate is None:
             return self._client.get_body_battery(startdate, *args, **kwargs)
         return self._client.get_body_battery(startdate, enddate, *args, **kwargs)
@@ -148,11 +157,18 @@ class CachedGarminClient:
         start = _as_date(startdate)
         end = _as_date(enddate)
         if start is None or end is None or start > end:
+            self._log(
+                f"get_activities_by_date {startdate!r}..{enddate!r} bypass (bad range)"
+            )
             return None
         # The whole window must be settled; a partially-ingested range would
         # silently drop recent activities.
         if not self._cache.is_cacheable_date(end):
             self._cache._count("skip")
+            self._log(
+                f"get_activities_by_date {start}..{end} skip "
+                "(range end newer than freshness floor)"
+            )
             return None
         try:
             result = self._cache.get_activities_by_date(start, end, activitytype)
@@ -217,6 +233,10 @@ class CachedGarminClient:
             )
             if cached is not None:
                 return cached
+        elif enddate is not None:
+            self._log(
+                f"get_body_composition {startdate}..{enddate} bypass (date range)"
+            )
         if enddate is None:
             return self._client.get_body_composition(startdate, *args, **kwargs)
         return self._client.get_body_composition(startdate, enddate, *args, **kwargs)

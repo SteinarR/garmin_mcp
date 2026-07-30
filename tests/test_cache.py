@@ -349,6 +349,79 @@ def test_missing_db_disables_activity_cache_only(data_dir):
 # -- wiring ---------------------------------------------------------------
 
 
+# -- verbose logging ------------------------------------------------------
+#
+# Every cache decision must leave a line when verbose is on. A silent bypass is
+# indistinguishable from a broken cache to anyone reading the logs.
+
+
+@pytest.fixture
+def verbose_client(data_dir, db_path, capsys):
+    cache = GarminCache(data_dir=data_dir, db_path=db_path, min_age_days=1)
+    live = FakeClient()
+    cached = CachedGarminClient(live, cache, enable_derived=True, verbose=True)
+    return cached, capsys
+
+
+def test_verbose_logs_hit(verbose_client):
+    cached, capsys = verbose_client
+    cached.get_sleep_data(SETTLED.isoformat())
+    assert "hit" in capsys.readouterr().out
+
+
+def test_verbose_logs_miss(verbose_client):
+    cached, capsys = verbose_client
+    absent = (SETTLED - datetime.timedelta(days=30)).isoformat()
+    cached.get_sleep_data(absent)
+    assert "miss" in capsys.readouterr().out
+
+
+def test_verbose_logs_skip_on_recent_date(verbose_client):
+    cached, capsys = verbose_client
+    cached.get_sleep_data(RECENT.isoformat())
+    out = capsys.readouterr().out
+    assert "skip" in out
+    assert "freshness floor" in out
+
+
+def test_verbose_logs_skip_on_recent_activity_range(verbose_client):
+    cached, capsys = verbose_client
+    cached.get_activities_by_date(SETTLED.isoformat(), RECENT.isoformat())
+    out = capsys.readouterr().out
+    assert "skip" in out
+
+
+def test_verbose_logs_bypass_on_body_battery_range(verbose_client):
+    cached, capsys = verbose_client
+    earlier = (SETTLED - datetime.timedelta(days=3)).isoformat()
+    cached.get_body_battery(earlier, SETTLED.isoformat())
+    assert "bypass" in capsys.readouterr().out
+
+
+def test_verbose_logs_bypass_on_body_composition_range(verbose_client):
+    cached, capsys = verbose_client
+    cached.get_body_composition(SETTLED.isoformat(), SETTLED.isoformat())
+    assert "bypass" in capsys.readouterr().out
+
+
+def test_verbose_logs_bypass_on_bad_date(verbose_client):
+    cached, capsys = verbose_client
+    cached.get_sleep_data("not-a-date")
+    assert "bypass" in capsys.readouterr().out
+
+
+def test_quiet_by_default(client, capsys):
+    cached, _ = client
+    cached.get_sleep_data(SETTLED.isoformat())
+    assert "garmin-cache" not in capsys.readouterr().out
+
+
+def test_skip_is_counted_as_well_as_logged(verbose_client):
+    cached, _ = verbose_client
+    cached.get_sleep_data(RECENT.isoformat())
+    assert cached.cache_stats["skip"] == 1
+
+
 def test_build_returns_client_unchanged_when_disabled(monkeypatch, data_dir):
     monkeypatch.delenv("GARMIN_CACHE_ENABLED", raising=False)
     live = FakeClient()
