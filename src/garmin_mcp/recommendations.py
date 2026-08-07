@@ -859,10 +859,9 @@ def register_tools(app):
                     try:
                         hrv = garmin_client.get_hrv_data(d)
                         day["hrv"] = hrv if hrv else None
-                        if isinstance(hrv, dict):
-                            val = hrv.get("avgHrv") or hrv.get("average")
-                            if isinstance(val, (int, float)):
-                                hrv_values.append(float(val))
+                        val = _extract_hrv_value(hrv)
+                        if val is not None:
+                            hrv_values.append(val)
                     except Exception:
                         day["hrv"] = None
 
@@ -962,8 +961,7 @@ def register_tools(app):
                 if "hrv" in include:
                     try:
                         hrv = garmin_client.get_hrv_data(d)
-                        if isinstance(hrv, dict):
-                            entry["hrv"] = hrv.get("avgHrv") or hrv.get("average")
+                        entry["hrv"] = _extract_hrv_value(hrv)
                     except Exception:
                         entry["hrv"] = None
                 # Sleep (hours)
@@ -1106,7 +1104,7 @@ def register_tools(app):
                     rec["rhr"] = None
                 try:
                     hrv = garmin_client.get_hrv_data(d)
-                    rec["hrv"] = hrv.get("avgHrv") or hrv.get("average") if isinstance(hrv, dict) else None
+                    rec["hrv"] = _extract_hrv_value(hrv)
                 except Exception:
                     rec["hrv"] = None
                 try:
@@ -1324,8 +1322,7 @@ def register_tools(app):
                 # HRV
                 try:
                     hrv = garmin_client.get_hrv_data(d)
-                    hv = hrv.get("avgHrv") or hrv.get("average") if isinstance(hrv, dict) else None
-                    have["hrv"] = isinstance(hv, (int, float))
+                    have["hrv"] = _extract_hrv_value(hrv) is not None
                 except Exception:
                     have["hrv"] = False
                 # Body battery

@@ -219,11 +219,21 @@ composite is no longer indistinguishable from a four-way one. Garmin's own score
 is reported alongside as `garmin_training_readiness` — prefer it where present,
 since it is Garmin's model rather than this equal-weighted heuristic.
 
-**Still open:** the same flat-key HRV read remains at `recommendations.py` lines
-753, 856, 999 and 1182, feeding `get_trends`, `detect_anomalies`,
-`get_optimized_health_data` and `get_coach_cues`. Those sites have the identical
-live/cache defect and are not covered by the fix above; `_extract_hrv_value` is
-in place for whoever takes them.
+**The same defect at four other call sites is also fixed.** All of them now go
+through `_extract_hrv_value`:
+
+| Tool | Was |
+|---|---|
+| `get_trends` | `hrv` `None` for every day in the series |
+| `detect_anomalies` | `hrv_depressed` could never fire — a real 30 ms drop went unflagged |
+| `get_data_completeness` | HRV always scored absent, deflating the completeness score |
+| `get_period_summary` | `avg_hrv` omitted from aggregates entirely |
+
+Note that an earlier revision of this file named `get_optimized_health_data` and
+`get_coach_cues` among the affected tools. That was wrong:
+`get_optimized_health_data` stores the HRV payload verbatim and never extracts a
+scalar, and `get_coach_cues` does not read HRV at all. The four above are the
+real set.
 
 ### Confirmed stable
 

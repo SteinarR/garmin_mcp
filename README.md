@@ -585,8 +585,9 @@ time series; the summary a caller actually wants is about 1% of the payload.
 so the component silently dropped out, and the 20–100 ms scale rated a normal
 night at 20/100. It now reads both the live and cached HRV shapes and scores
 against the user's own Garmin baseline, naming the components that actually
-entered the average. The same flat-key read still affects four other call sites
-in `recommendations.py`; see [TOOLS.md](TOOLS.md#known-broken-tools).
+entered the average. The same flat-key read silently blanked HRV in `get_trends`,
+`detect_anomalies`, `get_data_completeness` and `get_period_summary` too, and is
+fixed there as well; see [TOOLS.md](TOOLS.md#known-broken-tools).
 
 ### Kubernetes Issues
 
