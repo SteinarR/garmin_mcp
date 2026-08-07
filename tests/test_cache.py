@@ -573,3 +573,86 @@ def test_hrv_history_is_exposed_on_the_wrapper(client):
     cached, live = client
     assert cached.hrv_history(TODAY, days=30) == [62.0]
     assert live.calls == [], "history must never reach the live client"
+
+
+# -- enriched daily_training_state ----------------------------------------
+#
+# The ingestor now attaches the untouched source responses alongside the six
+# normalized fields, so hrvFactorPercent survives. Days written before that
+# change keep the six-field form and are not backfilled, so both paths matter.
+
+
+def _write_training_state(root, day, extra=None):
+    payload = {
+        "calendarDate": day,
+        "trainingReadiness": 62,
+        "trainingStatusCode": 3,
+        "acuteLoad": 210,
+        "chronicLoad": 190,
+        "loadRatio": 1.1,
+    }
+    payload.update(extra or {})
+    _write(root / "raw" / "daily_training_state" / f"{day}.json", payload)
+
+
+def test_readiness_served_verbatim_when_raw_present(tmp_path, data_dir):
+    day = SETTLED.isoformat()
+    _write_training_state(
+        data_dir,
+        day,
+        {"trainingReadinessRaw": {"score": 62, "hrvFactorPercent": 94, "sleepScore": 80}},
+    )
+    cache = GarminCache(data_dir=data_dir, min_age_days=1)
+    result = cache.get_training_readiness(SETTLED)
+    assert result["hrvFactorPercent"] == 94
+    assert result["sleepScore"] == 80
+    # Exact-tier reads carry no cache markers; a tool cannot tell them from live.
+    assert "_partial" not in result and "_source" not in result
+
+
+def test_readiness_falls_back_to_six_field_form(tmp_path, data_dir):
+    day = SETTLED.isoformat()
+    _write_training_state(data_dir, day)
+    cache = GarminCache(data_dir=data_dir, min_age_days=1)
+    result = cache.get_training_readiness(SETTLED)
+    assert result["trainingReadiness"] == 62
+    assert result["_partial"] is True
+    assert "hrvFactorPercent" not in result
+
+
+def test_readiness_raw_list_shape_served_as_stored(tmp_path, data_dir):
+    """Garmin's own endpoint returns a list; serve whatever was stored, untouched."""
+    day = SETTLED.isoformat()
+    _write_training_state(
+        data_dir, day, {"trainingReadinessRaw": [{"score": 62, "hrvFactorPercent": 94}]}
+    )
+    cache = GarminCache(data_dir=data_dir, min_age_days=1)
+    result = cache.get_training_readiness(SETTLED)
+    assert isinstance(result, list)
+    assert result[0]["hrvFactorPercent"] == 94
+
+
+def test_empty_raw_block_does_not_shadow_the_derived_form(tmp_path, data_dir):
+    day = SETTLED.isoformat()
+    _write_training_state(data_dir, day, {"trainingReadinessRaw": {}})
+    cache = GarminCache(data_dir=data_dir, min_age_days=1)
+    assert cache.get_training_readiness(SETTLED)["trainingReadiness"] == 62
+
+
+def test_training_status_served_verbatim_when_raw_present(tmp_path, data_dir):
+    day = SETTLED.isoformat()
+    _write_training_state(
+        data_dir, day, {"trainingStatusRaw": {"trainingStatusCode": 3, "extraField": "kept"}}
+    )
+    cache = GarminCache(data_dir=data_dir, min_age_days=1)
+    result = cache.get_training_status(SETTLED)
+    assert result["extraField"] == "kept"
+    assert "_partial" not in result
+
+
+def test_training_status_falls_back_to_six_field_form(tmp_path, data_dir):
+    _write_training_state(data_dir, SETTLED.isoformat())
+    cache = GarminCache(data_dir=data_dir, min_age_days=1)
+    result = cache.get_training_status(SETTLED)
+    assert result["acuteLoad"] == 210
+    assert result["_partial"] is True

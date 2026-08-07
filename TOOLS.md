@@ -216,11 +216,18 @@ trustworthiness, reported per call in `hrv_scoring_method`:
 | `personal_baseline_from_history` | Percentile bands over stored overnight HRV | Cached dates, ≥14 nights on disk |
 | `population_scale_approximate` | Fixed 20-70 ms map | Last resort: no cache, or too little history |
 
-The history tier exists because cached dates carry no baseline — the ingestor
-stores no HRV endpoint response for one to come from, so `cache.get_hrv_data`
-synthesises its result from raw sleep. Verified live, the fixed scale rated a
-40 ms night **40/100** where Garmin's own factor said **94**; percentile bands
-over the same user's 60-day history score it **91**.
+The history tier exists because cached dates carry no HRV baseline — the
+ingestor stores no HRV endpoint response for one to come from, so
+`cache.get_hrv_data` synthesises its result from raw sleep. Verified live, the
+fixed scale rated a 40 ms night **40/100** where Garmin's own factor said
+**94**; percentile bands over the same user's 60-day history score it **91**.
+
+Since 2026-08-07 the ingestor also attaches `trainingReadinessRaw` — the
+untouched readiness response, `hrvFactorPercent` included — alongside the six
+normalised fields it already wrote. `cache.get_training_readiness` serves that
+verbatim when present, so **cached dates now reach `garmin_hrv_factor` too**,
+with no live call. Days written before that change are not backfilled and still
+rely on the history tier, which is why both remain.
 
 `hrv_history` reads disk and never the live client, and exists only on the
 cached wrapper — an uncached deployment has no such attribute and falls through

@@ -319,9 +319,23 @@ class GarminCache:
         return payload if isinstance(payload, dict) else None
 
     def get_training_readiness(self, day):
-        """Derived: the ingestor keeps only the trainingReadiness scalar."""
+        """Exact where the ingestor stored the raw response, derived otherwise.
+
+        Payloads written since the ingestor stopped discarding it carry
+        `trainingReadinessRaw`: the untouched readiness response, including the
+        `hrvFactorPercent` that lets HRV be scored the way Garmin scores it.
+        Serve that verbatim and unmarked, like any other exact-tier read.
+
+        Older days only ever had the normalised scalar and are not backfilled,
+        so the derived form below still covers the historical tail.
+        """
         payload = self._daily_training_state(day)
-        if not payload or payload.get("trainingReadiness") is None:
+        if not payload:
+            return None
+        raw = payload.get("trainingReadinessRaw")
+        if raw:
+            return raw
+        if payload.get("trainingReadiness") is None:
             return None
         return {
             "score": payload["trainingReadiness"],
@@ -332,9 +346,14 @@ class GarminCache:
         }
 
     def get_training_status(self, day):
-        """Derived: training status code plus the acute/chronic load figures."""
+        """Exact where `trainingStatusRaw` is present, derived otherwise."""
         payload = self._daily_training_state(day)
-        if not payload or payload.get("trainingStatusCode") is None:
+        if not payload:
+            return None
+        raw = payload.get("trainingStatusRaw")
+        if raw:
+            return raw
+        if payload.get("trainingStatusCode") is None:
             return None
         return {
             "trainingStatusCode": payload["trainingStatusCode"],

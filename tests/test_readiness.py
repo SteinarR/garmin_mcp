@@ -571,3 +571,33 @@ def test_history_failure_falls_through_quietly(breakdown):
     result = breakdown(Exploding(hrv=cached_hrv(40)))
     assert result["hrv_scoring_method"] == "population_scale_approximate"
     assert result["components"]["hrv_score"] == 40.0
+
+
+def test_cached_date_uses_garmin_factor_once_the_ingestor_supplies_it(breakdown):
+    """The ingestor now stores trainingReadinessRaw, so cached dates get the real factor.
+
+    Before, a settled date had only the readiness scalar and fell through to a
+    history or population baseline. This is the top scoring tier reached
+    without a single live Garmin call.
+    """
+    client = HistoryClient(
+        hrv=cached_hrv(40),
+        readiness={"score": 62, "hrvFactorPercent": 94, "sleepScore": 80},
+    )
+    result = breakdown(client)
+    assert result["hrv_scoring_method"] == "garmin_hrv_factor"
+    assert result["components"]["hrv_score"] == 94.0
+    assert result["garmin_training_readiness"] == 62.0
+    assert client.history_calls == 0, "no need to build a baseline when Garmin supplies one"
+
+
+def test_history_still_covers_days_written_before_the_ingestor_change(breakdown):
+    """Historical days are not backfilled, so the fallback still has to work."""
+    client = HistoryClient(
+        hrv=cached_hrv(40),
+        readiness={"score": 62, "trainingReadiness": 62, "_partial": True},
+    )
+    result = breakdown(client)
+    assert result["hrv_scoring_method"] == "personal_baseline_from_history"
+    assert result["components"]["hrv_score"] > 90.0
+    assert result["garmin_training_readiness"] == 62.0

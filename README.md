@@ -494,10 +494,18 @@ Garmin returned, so tools cannot tell the difference:
 | `get_stats(date)` | `raw/stats/{date}.json` |
 | `get_body_battery(date, date)` | `raw/body_battery/{date}.json` |
 | `get_activities_by_date(start, end)` | SQLite `start_time` index + `raw/activities/{id}.json` |
+| `get_training_readiness(date)` | `raw/daily_training_state/{date}.json` → `trainingReadinessRaw` |
+| `get_training_status(date)` | `raw/daily_training_state/{date}.json` → `trainingStatusRaw` |
 
 `get_stats` and `get_body_battery` require the ingestor's `daily_wellness`
 category (`GARMIN_ENABLE_DAILY_WELLNESS=true`), which is off by default there.
 Only the single-day `get_body_battery` form is cached; wider ranges stay live.
+
+The two training-state calls are exact **only for days written since the
+ingestor started attaching the raw responses (2026-08-07)**. It used to keep
+just six normalized fields and discard the rest, which cost `hrvFactorPercent`
+among others. Earlier days are not backfilled — re-fetching 730 days would cost
+one Garmin call each — so they fall back to the derived form below.
 
 **Derived** (`GARMIN_CACHE_DERIVED`) — the ingestor normalizes these, so the
 response carries only the retained fields and is tagged `"_partial": true`:
@@ -506,8 +514,8 @@ response carries only the retained fields and is tagged `"_partial": true`:
 |------|--------|----------|
 | `get_rhr_day(date)` | raw sleep | `restingHeartRate` |
 | `get_hrv_data(date)` | raw sleep | `avgOvernightHrv`, `hrvStatus`, `hrvData` |
-| `get_training_readiness(date)` | `raw/daily_training_state/` | readiness score |
-| `get_training_status(date)` | `raw/daily_training_state/` | status code, acute/chronic load |
+| `get_training_readiness(date)` | `raw/daily_training_state/` | readiness score — pre-2026-08-07 days only, see above |
+| `get_training_status(date)` | `raw/daily_training_state/` | status code, acute/chronic load — pre-2026-08-07 days only |
 | `get_body_composition(date)` | `raw/body_metrics/` | weight, muscle mass, body fat |
 
 Everything else — `get_stress_data`, `get_max_metrics`, `get_heart_rates`,
