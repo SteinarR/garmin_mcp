@@ -240,6 +240,32 @@ Note that an earlier revision of this file named `get_optimized_health_data` and
 scalar, and `get_coach_cues` does not read HRV at all. The four above are the
 real set.
 
+### Body battery — the same defect, found in production
+
+Fixed. Five call sites read `bodyBatteryValue` off each top-level row of a
+`get_body_battery` payload. That is not the shape Garmin returns: the payload is
+a list of **day** objects, each holding its readings in `bodyBatteryValuesArray`
+as `[timestamp, status, level, version]` rows. The lookup matched nothing, so
+body battery silently dropped out of `get_readiness_breakdown`,
+`get_period_summary`, `get_trends`, `get_coach_cues` and
+`get_training_and_diet_recommendations`.
+
+All five now use `_extract_body_battery_levels`, which locates the level column
+via Garmin's own `bodyBatteryValueDescriptorDTOList` rather than trusting the
+position, falling back to index 2.
+
+Two things about how this was found are worth keeping:
+
+- **`components_missing` surfaced it.** A settled date returned
+  `body_battery_score: null` with a perfectly good cached payload on disk. The
+  old output could not have shown this — a dropped component was
+  indistinguishable from one that scored.
+- **The unit tests hid it.** The stub in `tests/test_readiness.py` was written
+  to match what the code *read* rather than what Garmin *returns*, so every
+  body-battery assertion passed against a payload shape that does not exist.
+  `tests/test_cache.py` had the correct shape the whole time. When writing a
+  fixture, copy the real payload; never infer it from the consuming code.
+
 ### Confirmed stable
 
 Depend on these freely:

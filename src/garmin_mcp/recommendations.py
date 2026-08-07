@@ -195,6 +195,64 @@ def _first_number(*values: Any) -> Optional[float]:
     return None
 
 
+def _body_battery_level_index(day: Dict[str, Any]) -> int:
+    """Column holding the battery level in each bodyBatteryValuesArray row.
+
+    Garmin ships a descriptor list naming the columns, so read the position
+    from it rather than trusting the usual
+    [timestamp, status, level, version] order.
+    """
+    descriptors = day.get("bodyBatteryValueDescriptorDTOList")
+    if isinstance(descriptors, list):
+        for descriptor in descriptors:
+            if not isinstance(descriptor, dict):
+                continue
+            key = descriptor.get("bodyBatteryValueDescriptorKey")
+            index = descriptor.get("bodyBatteryValueDescriptorIndex")
+            if key == "bodyBatteryLevel" and isinstance(index, int):
+                return index
+    return 2
+
+
+def _extract_body_battery_levels(payload: Any) -> List[float]:
+    """Every body battery sample level in a get_body_battery payload.
+
+    The payload is a list of *day* objects, not samples: each carries its
+    readings in `bodyBatteryValuesArray`. Reading `bodyBatteryValue` off the
+    top-level rows — as this module did everywhere — matches nothing, so the
+    body battery component silently dropped out of every score that used it.
+    """
+    levels: List[float] = []
+    if not isinstance(payload, list):
+        return levels
+    for day in payload:
+        if not isinstance(day, dict):
+            continue
+        # A flat value on the day object is not a shape Garmin is known to
+        # return, but it costs nothing to honour if one ever appears.
+        flat = _first_number(day.get("bodyBatteryValue"))
+        if flat is not None:
+            levels.append(flat)
+        rows = day.get("bodyBatteryValuesArray")
+        if not isinstance(rows, list):
+            continue
+        index = _body_battery_level_index(day)
+        for row in rows:
+            if isinstance(row, (list, tuple)) and len(row) > index:
+                value = _first_number(row[index])
+                if value is not None:
+                    levels.append(value)
+    return levels
+
+
+def _average_body_battery(payload: Any) -> Optional[float]:
+    """Mean body battery level for a payload, or None when it carries no samples."""
+    levels = _extract_body_battery_levels(payload)
+    if not levels:
+        return None
+    return sum(levels) / len(levels)
+
+
 def _extract_hrv_value(hrv: Any) -> Optional[float]:
     """Overnight average HRV in ms, from either payload shape.
 
@@ -547,13 +605,11 @@ def register_tools(app):
             # Analyze body battery trends
             body_battery_values = []
             for day in daily_summary:
-                battery = day.get("body_battery")
-                if battery and isinstance(battery, dict):
-                    # Extract body battery values
-                    if isinstance(battery, list) and len(battery) > 0:
-                        for entry in battery:
-                            if isinstance(entry, dict) and "bodyBatteryValue" in entry:
-                                body_battery_values.append(entry.get("bodyBatteryValue", 0))
+                # Guarded on isinstance(dict) before, which made the list
+                # handling below unreachable; the payload is always a list.
+                body_battery_values.extend(
+                    _extract_body_battery_levels(day.get("body_battery"))
+                )
             
             if body_battery_values:
                 avg_body_battery = sum(body_battery_values) / len(body_battery_values)
@@ -832,12 +888,7 @@ def register_tools(app):
                         bb = garmin_client.get_body_battery(d, d)
                         day["body_battery"] = bb if bb else None
                         # Aggregate best-effort
-                        if isinstance(bb, list):
-                            for entry in bb:
-                                if isinstance(entry, dict):
-                                    val = entry.get("bodyBatteryValue")
-                                    if isinstance(val, (int, float)):
-                                        body_battery_values.append(float(val))
+                        body_battery_values.extend(_extract_body_battery_levels(bb))
                     except Exception:
                         day["body_battery"] = None
 
@@ -991,17 +1042,10 @@ def register_tools(app):
                 if "body_battery" in include:
                     try:
                         bb = garmin_client.get_body_battery(d, d)
-                        avg_bb = None
-                        if isinstance(bb, list) and bb:
-                            vals = []
-                            for row in bb:
-                                if isinstance(row, dict):
-                                    val = row.get("bodyBatteryValue")
-                                    if isinstance(val, (int, float)):
-                                        vals.append(float(val))
-                            if vals:
-                                avg_bb = round(sum(vals)/len(vals), 2)
-                        entry["body_battery_avg"] = avg_bb
+                        avg_bb = _average_body_battery(bb)
+                        entry["body_battery_avg"] = (
+                            round(avg_bb, 2) if avg_bb is not None else None
+                        )
                     except Exception:
                         entry["body_battery_avg"] = None
                 # Weight (from body composition single day)
@@ -1209,10 +1253,7 @@ def register_tools(app):
             bb_score = None
             try:
                 bb = garmin_client.get_body_battery(date_str, date_str)
-                if isinstance(bb, list) and bb:
-                    vals = [float(row.get("bodyBatteryValue")) for row in bb if isinstance(row, dict) and isinstance(row.get("bodyBatteryValue"), (int, float))]
-                    if vals:
-                        bb_score = sum(vals)/len(vals)
+                bb_score = _average_body_battery(bb)
             except Exception:
                 pass
 
@@ -1431,10 +1472,9 @@ def register_tools(app):
                 # body battery
                 try:
                     bb = garmin_client.get_body_battery(d, d)
-                    if isinstance(bb, list):
-                        vals = [float(row.get("bodyBatteryValue")) for row in bb if isinstance(row, dict) and isinstance(row.get("bodyBatteryValue"), (int, float))]
-                        if vals:
-                            bb_values.append(sum(vals)/len(vals))
+                    avg_bb = _average_body_battery(bb)
+                    if avg_bb is not None:
+                        bb_values.append(avg_bb)
                 except Exception:
                     pass
                 # readiness

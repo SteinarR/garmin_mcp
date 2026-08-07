@@ -13,6 +13,8 @@ import pytest
 
 from garmin_mcp import recommendations
 from garmin_mcp.recommendations import (
+    _average_body_battery,
+    _extract_body_battery_levels,
     _extract_hrv_baseline,
     _extract_hrv_value,
     _first_number,
@@ -34,6 +36,31 @@ def live_hrv(value=36, baseline=BASELINE):
     if baseline is not None:
         summary["baseline"] = baseline
     return {"hrvSummary": summary, "hrvReadings": []}
+
+
+def real_body_battery(*levels, descriptor=True):
+    """The shape get_body_battery actually returns: one object per day.
+
+    Samples live in bodyBatteryValuesArray as [timestamp, status, level,
+    version] rows — NOT as `bodyBatteryValue` on the top-level rows. An earlier
+    version of this stub invented that flat shape to match what the code read,
+    so every body-battery assertion here passed while the real payload resolved
+    to nothing. tests/test_cache.py has always used the correct shape.
+    """
+    day = {
+        "date": DATE,
+        "bodyBatteryValuesArray": [
+            [1000 + i, "MEASURED", level, 1.0] for i, level in enumerate(levels)
+        ],
+    }
+    if descriptor:
+        day["bodyBatteryValueDescriptorDTOList"] = [
+            {"bodyBatteryValueDescriptorIndex": 0, "bodyBatteryValueDescriptorKey": "timestamp"},
+            {"bodyBatteryValueDescriptorIndex": 1, "bodyBatteryValueDescriptorKey": "bodyBatteryStatus"},
+            {"bodyBatteryValueDescriptorIndex": 2, "bodyBatteryValueDescriptorKey": "bodyBatteryLevel"},
+            {"bodyBatteryValueDescriptorIndex": 3, "bodyBatteryValueDescriptorKey": "bodyBatteryVersion"},
+        ]
+    return [day]
 
 
 def cached_hrv(value=36):
@@ -75,7 +102,7 @@ class StubClient:
     def get_body_battery(self, start, end, *a, **k):
         if not self._body_battery:
             return None
-        return [{"bodyBatteryValue": 70}, {"bodyBatteryValue": 80}]
+        return real_body_battery(70, 80)
 
     def get_hrv_data(self, cdate, *a, **k):
         return self._hrv
@@ -381,3 +408,76 @@ def test_period_summary_omits_hrv_when_absent(tools):
     client = WithActivities(hrv=None)
     result = tools("get_period_summary", client, "daily", RANGE_START, True, True, True, True, True, True)
     assert "avg_hrv" not in result["aggregates"]
+
+
+# --- Body battery ---------------------------------------------------------
+#
+# Found in production by the components_missing field added above: a settled
+# date returned body_battery_score null even though the cached payload existed.
+
+
+def test_levels_read_from_the_real_nested_shape():
+    assert _extract_body_battery_levels(real_body_battery(70, 80)) == [70.0, 80.0]
+
+
+def test_flat_top_level_key_matches_nothing():
+    """The shape the old code looked for. It is not what Garmin returns."""
+    assert _extract_body_battery_levels([{"bodyBatteryValue": 70}]) == [70.0]
+    assert _extract_body_battery_levels([{"date": DATE, "charged": 45, "drained": 60}]) == []
+
+
+def test_descriptor_overrides_the_positional_default():
+    payload = real_body_battery(descriptor=False)
+    payload[0]["bodyBatteryValuesArray"] = [[1000, 55, "MEASURED", 1.0]]
+    payload[0]["bodyBatteryValueDescriptorDTOList"] = [
+        {"bodyBatteryValueDescriptorIndex": 1, "bodyBatteryValueDescriptorKey": "bodyBatteryLevel"},
+    ]
+    assert _extract_body_battery_levels(payload) == [55.0]
+
+
+def test_positional_default_used_without_a_descriptor():
+    assert _extract_body_battery_levels(real_body_battery(64, descriptor=False)) == [64.0]
+
+
+def test_levels_collected_across_multiple_days():
+    payload = real_body_battery(70, 80) + real_body_battery(30)
+    assert _extract_body_battery_levels(payload) == [70.0, 80.0, 30.0]
+
+
+def test_malformed_payloads_yield_no_levels():
+    assert _extract_body_battery_levels(None) == []
+    assert _extract_body_battery_levels({"not": "a list"}) == []
+    assert _extract_body_battery_levels([{"bodyBatteryValuesArray": "nope"}]) == []
+    assert _extract_body_battery_levels([{"bodyBatteryValuesArray": [[1000]]}]) == []
+
+
+def test_average_is_none_when_there_are_no_samples():
+    assert _average_body_battery([]) is None
+    assert _average_body_battery(real_body_battery()) is None
+    assert _average_body_battery(real_body_battery(70, 80)) == 75.0
+
+
+def test_readiness_resolves_body_battery_on_the_real_shape(tools):
+    """The production symptom: body_battery_score was null with a payload present."""
+    result = tools("get_readiness_breakdown", StubClient(hrv=live_hrv(36)), DATE)
+    assert result["components"]["body_battery_score"] == 75.0
+    assert "body_battery_score" in result["components_used"]
+    assert "body_battery_score" not in result["components_missing"]
+
+
+def test_trends_averages_body_battery_on_the_real_shape(tools):
+    result = tools(
+        "get_trends", StubClient(hrv=live_hrv(36)), RANGE_START, RANGE_END, ["body_battery"]
+    )
+    assert all(day["body_battery_avg"] == 75.0 for day in result["series"])
+
+
+def test_period_summary_aggregates_body_battery(tools):
+    class WithActivities(StubClient):
+        def get_activities_by_date(self, start, end, *a, **k):
+            return []
+
+    result = tools(
+        "get_period_summary", WithActivities(), "daily", RANGE_START, True, True, True, True, True, True
+    )
+    assert result["aggregates"]["avg_body_battery"] == 75.0
