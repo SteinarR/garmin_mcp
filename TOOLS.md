@@ -2,6 +2,10 @@
 
 This document lists all MCP tools available in the Garmin MCP Server.
 
+Registered is not the same as working. Read
+[Known-broken tools](#known-broken-tools) before depending on anything below —
+five of these fail consistently against Garmin and are not worth debugging.
+
 ## Core Activity Tools (from __init__.py)
 - `list_activities(limit: int = 5)` - List recent Garmin activities
 
@@ -118,4 +122,54 @@ This document lists all MCP tools available in the Garmin MCP Server.
 ## Total: 78 MCP Tools
 
 **Note:** Date parameters should be in `YYYY-MM-DD` format. Some tools may require specific Garmin device features or subscription levels to return data.
+
+## Known-broken tools
+
+Recorded so nobody spends an afternoon on a server-side failure. These are
+registered and callable, but fail consistently in normal use. **Do not debug
+them without new information** — the failures are upstream of this repo.
+
+| Tool | Failure | Where it lives |
+|---|---|---|
+| `get_trends` | Errors on every date range, short or long | `recommendations.py` |
+| `get_endurance_score` | Approval/execution errors | `training.py:68` |
+| `get_race_predictions` | Approval/execution errors | `challenges.py:133` |
+| `get_fitnessage_data` | Execution errors | `training.py:129` |
+| `get_personal_record` | Execution errors | `challenges.py:47` |
+
+`get_endurance_score` and `get_race_predictions` return "approval" errors, which
+is Garmin declining the request for this account rather than a bug in the call —
+no amount of parameter fiddling changes it.
+
+### `get_hrv_data` — needs re-verification, not debugging
+
+Reported as an intermittent Pydantic validation error (`Input should be a valid
+string`, receiving a dict), succeeding on retry. That symptom is exactly what
+`_to_json_str` fixed in `6273370` (2026-07-29), which is an ancestor of every
+currently deployed ref — so either the observation predates the deploy, or the
+cause is something else.
+
+Left in place because it has not been re-tested since. It is also not on the
+critical path: HRV arrives inside `get_sleep_data`, which is where the sleep
+analyst reads it. If someone does re-test, record the result here and delete
+this note either way.
+
+### Confirmed stable
+
+Depend on these freely:
+
+- `get_sleep_data` (single date)
+- `get_optimized_health_data` (date ranges)
+- `get_activities_by_date` / `get_activities_fordate`
+- `get_activity_splits`
+- `get_activity_hr_in_timezones`
+- `get_weigh_ins`
+
+### Long sessions
+
+Many sequential calls in one session hit rate limiting or drop the MCP
+connection outright. For any backfill, prefer monthly chunks via
+`get_optimized_health_data` over per-day calls, and keep the call count per
+session modest. See the cache notes in [README.md](README.md#ingested-data-cache)
+for how much of this the ingested-data cache absorbs.
 

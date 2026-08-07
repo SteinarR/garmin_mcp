@@ -529,6 +529,10 @@ day by day with no upper limit. Every uncached metric costs one API call per day
 of range, so a single 365-day request can issue well over a thousand calls
 against a ~90-100/day budget.
 
+(`get_trends` is in that list for completeness only — it errors on every range
+it is given, so it never reaches the loop. See
+[Known-broken tools](TOOLS.md#known-broken-tools).)
+
 The cache reduces this sharply where it has coverage, but it is not a limit. A
 sanity cap on range length would be worth adding on its own merits.
 
@@ -560,6 +564,18 @@ OAuth tokens are automatically saved to `~/.garminconnect` (or path specified by
 1. **Can't connect to server**: Verify the server is binding to `0.0.0.0` (not `127.0.0.1`)
 2. **Connection refused**: Check firewall rules and port exposure
 3. **404 errors**: Ensure you're using the correct transport type (Streamable HTTP for network access)
+
+### Tools that fail no matter what you do
+
+Five registered tools fail consistently against Garmin and are **not** worth
+investigating: `get_trends`, `get_endurance_score`, `get_race_predictions`,
+`get_fitnessage_data` and `get_personal_record`. A sixth, `get_hrv_data`, has an
+older report that may already be fixed and needs re-verification rather than
+debugging.
+
+The table, the symptoms, and the list of endpoints confirmed stable are in
+[TOOLS.md](TOOLS.md#known-broken-tools). Check there before spending time on a
+call that returns an error — the failures are upstream of this repo.
 
 ### Kubernetes Issues
 
