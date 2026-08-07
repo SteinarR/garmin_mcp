@@ -580,12 +580,13 @@ already be fixed and needs re-verification rather than debugging.
 characters, which exceeds the MCP result limit. Two-thirds of that is per-minute
 time series; the summary a caller actually wants is about 1% of the payload.
 
-**Succeeds and returns a wrong answer.** `get_readiness_breakdown` reads HRV
-from a field live Garmin does not populate, so the component silently drops out;
-when it does resolve, the 20–100 ms scale rates a normal night at 20/100. It
-only looks correct against cached dates, because the cache flattens HRV to the
-field the code expects. This is the one worth fixing — a broken tool announces
-itself, this one does not.
+**Succeeded and returned a wrong answer — now fixed.**
+`get_readiness_breakdown` read HRV from a field live Garmin does not populate,
+so the component silently dropped out, and the 20–100 ms scale rated a normal
+night at 20/100. It now reads both the live and cached HRV shapes and scores
+against the user's own Garmin baseline, naming the components that actually
+entered the average. The same flat-key read still affects four other call sites
+in `recommendations.py`; see [TOOLS.md](TOOLS.md#known-broken-tools).
 
 ### Kubernetes Issues
 

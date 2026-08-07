@@ -115,7 +115,7 @@ a wrong number without erroring.
 - `get_period_summary(period: str, anchor_date: Optional[str] = None, include_activities: bool = True, include_sleep: bool = True, include_stress: bool = True, include_body_battery: bool = True, include_training_readiness: bool = True, include_hrv: bool = False, include_stats: bool = True, activity_type: str = "")` - Single-pane summary for daily/weekly/monthly with aggregates and per-day details (accepts anchor phrases like "last week", "this month")
 - `get_trends(start_date: str, end_date: str, include: Optional[List[str]] = None)` - Trends with 7/28-day rolling averages and start→end deltas for selected metrics (start/end may be relative phrases such as "last 28 days")
 - `detect_anomalies(start_date: str, end_date: str, rhr_bpm_increase: int = 5, hrv_ms_drop: int = 15, sleep_hours_min: float = 6.0, steps_drop_pct: float = 30.0)` - Heuristic anomaly detection for recovery red flags (range accepts relative phrases)
-- `get_readiness_breakdown(date: str)` - Component scores (sleep, body battery, HRV, stress inverse) and combined readiness score (0–100) for a date or relative phrase (e.g., "today", "last week")
+- `get_readiness_breakdown(date: str)` - Component scores (sleep, body battery, HRV, stress inverse), which components resolved, and a combined readiness score (0–100) for a date or relative phrase (e.g., "today", "last week"). Reports Garmin's own training readiness alongside the composite
 - `get_data_completeness(start_date: str, end_date: str)` - Per-day completeness and overall score across key signals (sleep, steps, HR, HRV, body battery) with support for relative ranges
 - `get_hydration_guidance(weight_kg: float, training_minutes: int = 0, temperature_c: Optional[float] = None)` - Daily hydration target (ml) with baseline, training increment, and heat multiplier
 - `get_coach_cues(period: str, anchor_date: Optional[str] = None)` - Concise coach guidance for daily/weekly/monthly periods using high-signal metrics
@@ -185,28 +185,45 @@ the tool. Anything that must go through MCP needs either a summary tool that
 returns Garmin's own `dailySleepDTO` scores and qualifiers, or an opt-in flag
 that drops the epoch series.
 
-### `get_readiness_breakdown` — returns a confident wrong number
+### `get_readiness_breakdown` — fixed, but still a heuristic
 
-Two defects, both still present, and neither raises an error — which is what
-makes them worse than the broken list above.
+Both defects recorded here are fixed. Covered by `tests/test_readiness.py`,
+which runs offline.
 
-**The HRV component is dead on live data.** Five call sites read
-`hrv.get("avgHrv") or hrv.get("average")` — `recommendations.py` lines 753,
-856, 999, 1111 and 1182 — but live `get_hrv_data` nests the value at
-`hrvSummary.lastNightAvg`. It resolves to `None`, so readiness silently becomes
-a three-component average instead of four. It only populates when served from
-cache, because `cache.py:201` happens to flatten it to `avgHrv` — so the bug
-disappears exactly when you test against settled dates and reappears on today.
+**The HRV component was dead on live data.** The tool read
+`hrv.get("avgHrv") or hrv.get("average")`, but live `get_hrv_data` nests the
+value at `hrvSummary.lastNightAvg`. It resolved to `None`, so readiness silently
+became a three-component average instead of four — and it only populated when
+served from cache, because `cache.py:201` flattens HRV to `avgHrv`. The bug
+therefore disappeared exactly when tested against settled dates and reappeared
+on today. `_extract_hrv_value` now reads both shapes, preferring the live one.
 
-**The scale is miscalibrated when it does work.** `recommendations.py:1114`
-maps 20 ms → 0 and 100 ms → 100. An overnight HRV of 36 ms scores **20/100**,
-while Garmin's own baseline calls the same night `BALANCED` and rates the HRV
-factor 96 `GOOD`. A good night is scored as near-total failure and drags the
-composite down with it.
+**The scale was miscalibrated when it did work.** The old map ran 20 ms → 0 and
+100 ms → 100, so a 36 ms night scored **20/100** while Garmin's own baseline
+called it `BALANCED` and rated the HRV factor 96 `GOOD`. HRV is too individual
+for fixed millisecond thresholds. Scoring now runs in descending order of
+trustworthiness, reported per call in `hrv_scoring_method`:
 
-`get_training_readiness` already returns the shape this tool is trying to
-compute — score, `sleepScore`, `sleepHistoryFactorPercent` — in about 1 KB.
-That is the thing to copy, rather than deriving readiness from raw hours.
+| Method | Source | When |
+|---|---|---|
+| `garmin_hrv_factor` | `hrvFactorPercent` from `get_training_readiness` | Live, and Garmin supplies the factor |
+| `personal_baseline` | `hrvSummary.baseline` — the user's own balanced band | Live, no factor available |
+| `population_scale_approximate` | Fixed 20-70 ms map | Cached dates, which carry no baseline |
+
+On the recorded 36 ms night that scored 20: it now scores 96 via Garmin's own
+factor, or 60 against the personal baseline when the factor is absent.
+
+**A dropped component is now named, not hidden.** `components_used` and
+`components_missing` say which components entered the average, so a three-way
+composite is no longer indistinguishable from a four-way one. Garmin's own score
+is reported alongside as `garmin_training_readiness` — prefer it where present,
+since it is Garmin's model rather than this equal-weighted heuristic.
+
+**Still open:** the same flat-key HRV read remains at `recommendations.py` lines
+753, 856, 999 and 1182, feeding `get_trends`, `detect_anomalies`,
+`get_optimized_health_data` and `get_coach_cues`. Those sites have the identical
+live/cache defect and are not covered by the fix above; `_extract_hrv_value` is
+in place for whoever takes them.
 
 ### Confirmed stable
 

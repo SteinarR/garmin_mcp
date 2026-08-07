@@ -185,6 +185,116 @@ def _resolve_anchor_period(period: str, anchor_value: Optional[str]) -> Tuple[da
     return start, end, anchor_used
 
 
+def _first_number(*values: Any) -> Optional[float]:
+    """First value that is a real number. Unlike `a or b`, a legitimate 0 wins."""
+    for value in values:
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            return float(value)
+    return None
+
+
+def _extract_hrv_value(hrv: Any) -> Optional[float]:
+    """Overnight average HRV in ms, from either payload shape.
+
+    Live Garmin nests it at `hrvSummary.lastNightAvg`. The ingested-data cache
+    flattens it to `avgHrv`/`average` (cache.py). Reading only the flat keys
+    makes this resolve on cached dates and silently return None on live ones.
+    """
+    if not isinstance(hrv, dict):
+        return None
+    summary = hrv.get("hrvSummary")
+    if not isinstance(summary, dict):
+        summary = {}
+    return _first_number(
+        summary.get("lastNightAvg"),
+        hrv.get("lastNightAvg"),
+        hrv.get("avgHrv"),
+        hrv.get("average"),
+    )
+
+
+def _extract_hrv_baseline(hrv: Any) -> Optional[Dict[str, float]]:
+    """The user's personal HRV baseline bands, when live Garmin supplies them."""
+    if not isinstance(hrv, dict):
+        return None
+    summary = hrv.get("hrvSummary")
+    if not isinstance(summary, dict):
+        return None
+    baseline = summary.get("baseline")
+    if not isinstance(baseline, dict):
+        return None
+    low_upper = _first_number(baseline.get("lowUpper"))
+    balanced_low = _first_number(baseline.get("balancedLow"))
+    balanced_upper = _first_number(baseline.get("balancedUpper"))
+    if balanced_low is None or balanced_upper is None or balanced_upper <= balanced_low:
+        return None
+    return {
+        "low_upper": low_upper if low_upper is not None else balanced_low,
+        "balanced_low": balanced_low,
+        "balanced_upper": balanced_upper,
+    }
+
+
+def _score_hrv_against_baseline(value: float, baseline: Dict[str, float]) -> float:
+    """Score overnight HRV against the user's own balanced band, not a fixed scale.
+
+    HRV is strongly individual, so absolute millisecond thresholds misjudge
+    people whose normal sits outside them. Garmin publishes a per-user baseline;
+    these segments map onto its own zones — balanced spans 60-90, at or above the
+    top of balanced earns 90-100, and the low zone falls away below 40.
+    """
+    low_upper = baseline["low_upper"]
+    balanced_low = baseline["balanced_low"]
+    balanced_upper = baseline["balanced_upper"]
+
+    if value >= balanced_upper:
+        # Room above the band, but flatten it: more HRV is not linearly better.
+        headroom = max(balanced_upper * 0.25, 1.0)
+        over = min((value - balanced_upper) / headroom, 1.0)
+        return round(90.0 + 10.0 * over, 2)
+    if value >= balanced_low:
+        span = balanced_upper - balanced_low
+        return round(60.0 + 30.0 * (value - balanced_low) / span, 2)
+    if value >= low_upper and balanced_low > low_upper:
+        span = balanced_low - low_upper
+        return round(40.0 + 20.0 * (value - low_upper) / span, 2)
+    floor = max(low_upper * 0.6, 1.0)
+    if value <= floor:
+        return 0.0
+    return round(40.0 * (value - floor) / (low_upper - floor), 2)
+
+
+def _garmin_hrv_factor(readiness: Any) -> Optional[float]:
+    """Garmin's own HRV factor (0-100) out of a training readiness payload.
+
+    Live Garmin returns a single-element list; the cache returns a bare dict
+    carrying only the readiness scalar, so this is absent there.
+    """
+    if isinstance(readiness, list):
+        readiness = readiness[0] if readiness else None
+    if not isinstance(readiness, dict):
+        return None
+    return _first_number(readiness.get("hrvFactorPercent"))
+
+
+def _garmin_readiness_score(readiness: Any) -> Optional[float]:
+    """Garmin's own training readiness score (0-100), across both payload shapes."""
+    if isinstance(readiness, list):
+        readiness = readiness[0] if readiness else None
+    if not isinstance(readiness, dict):
+        return None
+    nested = readiness.get("trainingReadiness")
+    if isinstance(nested, dict):
+        value = _first_number(nested.get("value"), nested.get("score"))
+        if value is not None:
+            return value
+    # A bare `trainingReadiness` scalar is what the cache stores; a dict here
+    # already failed above and is ignored by _first_number.
+    return _first_number(readiness.get("score"), nested)
+
+
 def register_tools(app):
     """Register all recommendation tools with the MCP server app"""
     
@@ -1059,12 +1169,18 @@ def register_tools(app):
     @app.tool()
     async def get_readiness_breakdown(date: str) -> str:
         """Provide a simple readiness breakdown (0-100) from available components for a given date.
-        
+
         Components:
           - sleep_hours target 8h (0-100)
           - body_battery avg (0-100)
-          - HRV scaled (heuristic: 0-100 by mapping 20-100 ms)
+          - HRV, scored against the user's own Garmin baseline when available
           - stress inverse (if present) 0-100
+
+        Garmin's own training readiness score is reported alongside the composite
+        under `garmin_training_readiness`. Prefer it where it is present: it is
+        Garmin's model rather than this equal-weighted heuristic. `components_used`
+        names the components that actually resolved, since a missing one is
+        dropped from the average rather than counted as zero.
         """
         try:
             resolved_date = _parse_single_date(date)
@@ -1102,17 +1218,37 @@ def register_tools(app):
             except Exception:
                 pass
 
-            # HRV heuristic scale 20-100 ms -> 0-100
+            # Garmin's own readiness model, used for the HRV factor below and
+            # reported alongside the composite for comparison.
+            garmin_readiness = None
+            garmin_hrv_factor = None
+            try:
+                readiness_payload = garmin_client.get_training_readiness(date_str)
+                garmin_readiness = _garmin_readiness_score(readiness_payload)
+                garmin_hrv_factor = _garmin_hrv_factor(readiness_payload)
+            except Exception:
+                pass
+
+            # HRV, in descending order of trustworthiness: Garmin's own factor,
+            # then the user's personal baseline, then a population-scale guess.
             hrv_score = None
+            hrv_value = None
+            hrv_method = None
             try:
                 hrv = garmin_client.get_hrv_data(date_str)
-                val = None
-                if isinstance(hrv, dict):
-                    val = hrv.get("avgHrv") or hrv.get("average")
-                if isinstance(val, (int, float)):
-                    v = float(val)
-                    # Map 20ms -> 0, 100ms -> 100
-                    hrv_score = max(0.0, min(100.0, (v - 20.0) / (100.0 - 20.0) * 100.0))
+                hrv_value = _extract_hrv_value(hrv)
+                baseline = _extract_hrv_baseline(hrv)
+                if garmin_hrv_factor is not None:
+                    hrv_score = max(0.0, min(100.0, garmin_hrv_factor))
+                    hrv_method = "garmin_hrv_factor"
+                elif hrv_value is not None and baseline is not None:
+                    hrv_score = _score_hrv_against_baseline(hrv_value, baseline)
+                    hrv_method = "personal_baseline"
+                elif hrv_value is not None:
+                    # No baseline to compare against. This is a coarse population
+                    # scale and will misjudge anyone whose normal sits outside it.
+                    hrv_score = max(0.0, min(100.0, (hrv_value - 20.0) / (70.0 - 20.0) * 100.0))
+                    hrv_method = "population_scale_approximate"
             except Exception:
                 pass
 
@@ -1129,20 +1265,29 @@ def register_tools(app):
             except Exception:
                 pass
 
-            # Combine available components equally
-            comps = [s for s in [sleep_score, bb_score, hrv_score, stress_score] if isinstance(s, (int, float))]
-            readiness = round(sum(comps)/len(comps), 2) if comps else None
+            # Combine available components equally. A component that did not
+            # resolve is dropped rather than zeroed, so name the survivors: the
+            # composite is otherwise indistinguishable from a full four-way one.
+            named = {
+                "sleep_score": sleep_score,
+                "body_battery_score": bb_score,
+                "hrv_score": hrv_score,
+                "stress_inverse_score": stress_score,
+            }
+            used = [name for name, score in named.items() if isinstance(score, (int, float))]
+            missing = [name for name in named if name not in used]
+            readiness = round(sum(named[name] for name in used)/len(used), 2) if used else None
 
             return _to_json_str({
                 "date": date_str,
                 "input": date,
-                "components": {
-                    "sleep_score": sleep_score,
-                    "body_battery_score": bb_score,
-                    "hrv_score": hrv_score,
-                    "stress_inverse_score": stress_score
-                },
-                "readiness_score": readiness
+                "components": named,
+                "components_used": used,
+                "components_missing": missing,
+                "hrv_ms": hrv_value,
+                "hrv_scoring_method": hrv_method,
+                "readiness_score": readiness,
+                "garmin_training_readiness": garmin_readiness,
             })
         except Exception as e:
             return f"Error computing readiness breakdown: {str(e)}"
