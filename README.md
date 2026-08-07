@@ -395,12 +395,39 @@ kubectl apply -f httproute.yaml
 
 *Required only if MFA is enabled on your Garmin Connect account, and only on first run or when tokens expire
 
+## API Budget
+
+**Garmin rate-limits hard, and the budget is the binding constraint on this
+server. Make only the calls you actually need.**
+
+Garmin Connect tolerates roughly **90-100 API calls per day** across the whole
+account. Exceeding it does not fail cleanly — calls start erroring, and long
+sessions drop the MCP connection outright. The budget is shared with anything
+else touching the same account, including the ingestor.
+
+Practical rules:
+
+- **Never call a range tool to get one day.** The per-day loops cost 5-7 calls
+  for *every* day in the range, cached or not.
+- **Prefer `get_optimized_health_data` over per-day calls** for any backfill,
+  and take it in monthly chunks rather than one long span.
+- **Ask for the metrics you need**, not the defaults. `get_trends` and
+  `get_period_summary` both take include-lists; every extra metric is another
+  call per day.
+- **Settled dates are nearly free** where the cache covers them; today and
+  yesterday are never cached and always cost live calls. See
+  [Freshness](#freshness).
+- **Watch for `[garmin-cache] WARNING`** in the logs. It means the cache is off
+  and every query is hitting Garmin.
+- **Keep sessions short.** Many sequential calls in one session hit rate
+  limiting or drop the connection.
+
 ## Ingested Data Cache
 
-Garmin Connect tolerates roughly 90-100 API calls per day. Tools that loop over a
-date range (`get_trends`, `detect_anomalies`, `get_optimized_health_data`,
-`get_period_summary`, `get_coach_cues`) spend 5-7 calls *per day of range*, so a
-90-day trend query alone can exhaust the budget several times over.
+Tools that loop over a date range (`detect_anomalies`,
+`get_optimized_health_data`, `get_period_summary`, `get_coach_cues`) spend 5-7
+calls *per day of range*, so a 90-day query alone can exhaust the daily budget
+several times over.
 
 If this server runs alongside a
 [garmin-ingestor](https://github.com/steinarr/personal-ai) deployment, it can
@@ -439,6 +466,18 @@ always present and a read-only mount can reuse them. Stop that container while
 nothing else is connected and the files disappear — after which a read-only
 mount cannot recreate them. Testing the mount proves nothing about the state you
 will eventually be in.
+
+This no longer fails silently. When SQLite reports `SQLITE_READONLY_DIRECTORY`,
+the server logs once, regardless of `GARMIN_CACHE_VERBOSE`:
+
+```
+[garmin-cache] WARNING: cannot open '/context-db/context_kernel.db' because its
+directory is read-only. ... Activity range caching is OFF and every range query
+is going to the live Garmin API instead.
+```
+
+Seeing that line means the mount is wrong and you are burning the API budget.
+Any other SQLite failure warns once too, with the underlying error.
 
 The cache is **read-through and fail-open**: a miss, an unrecognized argument
 shape, or any cache error falls back to the live API. It is disabled unless

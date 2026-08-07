@@ -38,6 +38,30 @@ SOURCE_VALUE = "garmin-ingestor-cache"
 TRAINING_STATE_MIN_AGE_DAYS = 2
 
 
+def _default_warning(message):
+    print(f"[garmin-cache] WARNING: {message}")
+
+
+def _is_readonly_directory_error(exc):
+    """True when SQLite failed because it cannot write beside the database.
+
+    Opening a WAL database needs a `-shm` file in the database's directory. A
+    read-only mount cannot create one, and SQLite reports that as
+    SQLITE_READONLY_DIRECTORY. This is worth singling out because it looks like
+    a working mount right up until it isn't: `-wal` and `-shm` survive on disk
+    only while some connection holds them open, so a read-only mount reuses the
+    files another container left behind and reads fine. Stop that container
+    while nothing else is connected, the files go away, and every query here
+    starts failing — silently, as a fallback to the live Garmin API.
+    """
+    # sqlite_errorname needs Python 3.11; pyproject allows 3.10, hence the
+    # message fallback.
+    name = getattr(exc, "sqlite_errorname", None)
+    if name is not None:
+        return name == "SQLITE_READONLY_DIRECTORY"
+    return "attempt to write a readonly database" in str(exc)
+
+
 def _as_date(value):
     """Coerce a date, datetime or YYYY-MM-DD string to a date. None if invalid."""
     if isinstance(value, datetime.datetime):
@@ -55,18 +79,31 @@ def _as_date(value):
 class GarminCache:
     """Reads ingested Garmin payloads from disk and the context SQLite DB."""
 
-    def __init__(self, data_dir, db_path=None, min_age_days=1):
+    def __init__(self, data_dir, db_path=None, min_age_days=1, on_warning=None):
         self.data_dir = Path(os.path.expanduser(str(data_dir)))
         self.db_path = Path(os.path.expanduser(str(db_path))) if db_path else None
         self.min_age_days = max(0, int(min_age_days))
         self._lock = threading.Lock()
         self.stats = {"hit": 0, "miss": 0, "skip": 0, "error": 0}
+        # Deliberately not gated on GARMIN_CACHE_VERBOSE: these warn about
+        # misconfiguration that is otherwise invisible, and verbose is meant to
+        # stay off in normal operation.
+        self._on_warning = on_warning if callable(on_warning) else _default_warning
+        self._warned = set()
 
     # -- bookkeeping ------------------------------------------------------
 
     def _count(self, outcome):
         with self._lock:
             self.stats[outcome] = self.stats.get(outcome, 0) + 1
+
+    def _warn_once(self, key, message):
+        """Emit `message` the first time `key` is seen. Queries repeat; this must not."""
+        with self._lock:
+            if key in self._warned:
+                return
+            self._warned.add(key)
+        self._on_warning(message)
 
     def is_cacheable_date(self, day, min_age_days=None):
         """True when `day` is old enough that the ingestor has settled data for it."""
@@ -114,8 +151,25 @@ class GarminCache:
             )
             conn.row_factory = sqlite3.Row
             return conn.execute(sql, params).fetchall()
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
             self._count("error")
+            if _is_readonly_directory_error(exc):
+                self._warn_once(
+                    "readonly_directory",
+                    f"cannot open '{self.db_path}' because its directory is "
+                    "read-only. SQLite needs to create a -shm file next to a WAL "
+                    "database. Activity range caching is OFF and every range "
+                    "query is going to the live Garmin API instead. Mount the "
+                    "directory holding the context DB read-write; the connection "
+                    "itself stays mode=ro, so this server still cannot write to "
+                    "the database.",
+                )
+            else:
+                self._warn_once(
+                    "sqlite_error",
+                    f"query against '{self.db_path}' failed ({exc}). Activity "
+                    "range caching is falling back to the live Garmin API.",
+                )
             return []
         finally:
             if conn is not None:

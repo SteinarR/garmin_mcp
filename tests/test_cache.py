@@ -7,11 +7,12 @@ recording stub, and the ingestor layout is built in a tmp_path fixture.
 
 import datetime
 import json
+import os
 import sqlite3
 
 import pytest
 
-from garmin_mcp.cache import GarminCache
+from garmin_mcp.cache import GarminCache, _is_readonly_directory_error
 from garmin_mcp.cached_client import CachedGarminClient, build_cached_client
 
 
@@ -443,3 +444,88 @@ def test_build_degrades_when_dir_missing(monkeypatch, tmp_path):
     monkeypatch.setenv("GARMIN_CACHE_DIR", str(tmp_path / "nope"))
     live = FakeClient()
     assert build_cached_client(live) is live
+
+
+# -- read-only mount warning ---------------------------------------------
+#
+# The trap this guards against: a read-only context-DB mount works for as long
+# as some other connection keeps -wal/-shm alive on disk, then starts failing
+# silently once they are gone. See _is_readonly_directory_error in cache.py.
+
+
+def test_readonly_directory_error_is_recognised():
+    exc = sqlite3.OperationalError("attempt to write a readonly database")
+    assert _is_readonly_directory_error(exc)
+
+
+def test_other_sqlite_errors_are_not_mistaken_for_it():
+    assert not _is_readonly_directory_error(sqlite3.OperationalError("no such table: x"))
+    assert not _is_readonly_directory_error(sqlite3.DatabaseError("file is not a database"))
+
+
+def test_warning_fires_once_not_per_query(data_dir, db_path):
+    seen = []
+    cache = GarminCache(
+        data_dir=data_dir, db_path=db_path, min_age_days=1, on_warning=seen.append
+    )
+
+    def explode(*a, **k):
+        raise sqlite3.OperationalError("attempt to write a readonly database")
+
+    original = sqlite3.connect
+    sqlite3.connect = explode
+    try:
+        for _ in range(3):
+            assert cache._query("SELECT 1") == []
+    finally:
+        sqlite3.connect = original
+
+    assert len(seen) == 1
+    assert "read-only" in seen[0]
+    assert str(db_path) in seen[0]
+    assert cache.stats["error"] == 3
+
+
+def test_unrecognised_sqlite_error_warns_separately(data_dir, db_path):
+    seen = []
+    cache = GarminCache(
+        data_dir=data_dir, db_path=db_path, min_age_days=1, on_warning=seen.append
+    )
+    original = sqlite3.connect
+    sqlite3.connect = lambda *a, **k: (_ for _ in ()).throw(sqlite3.OperationalError("no such table: x"))
+    try:
+        assert cache._query("SELECT 1") == []
+    finally:
+        sqlite3.connect = original
+    assert len(seen) == 1
+    assert "no such table" in seen[0]
+    assert "read-only" not in seen[0]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_readonly_directory_reproduced_end_to_end(tmp_path, data_dir):
+    """The real thing: a WAL database whose -shm cannot be recreated."""
+    db_dir = tmp_path / "context"
+    db_dir.mkdir()
+    real_db = db_dir / "context_kernel.db"
+    conn = sqlite3.connect(real_db)
+    conn.execute("PRAGMA journal_mode=wal")
+    conn.execute("CREATE TABLE activity_records (garmin_activity_id TEXT)")
+    conn.commit()
+    conn.close()
+    # Drop the sidecars the way SQLite does when the last connection closes,
+    # then take away the directory's write bit.
+    for suffix in ("-wal", "-shm"):
+        sidecar = real_db.with_name(real_db.name + suffix)
+        if sidecar.exists():
+            sidecar.unlink()
+    db_dir.chmod(0o555)
+    seen = []
+    try:
+        cache = GarminCache(
+            data_dir=data_dir, db_path=real_db, min_age_days=1, on_warning=seen.append
+        )
+        assert cache._query("SELECT 1 FROM activity_records") == []
+    finally:
+        db_dir.chmod(0o755)
+    assert seen and "read-only" in seen[0]

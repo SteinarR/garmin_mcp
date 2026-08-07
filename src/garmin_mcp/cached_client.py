@@ -275,6 +275,7 @@ def build_cached_client(client):
         data_dir=data_dir,
         db_path=db_path,
         min_age_days=_env_int("GARMIN_CACHE_MIN_AGE_DAYS", 1),
+        on_warning=lambda message: print(f"[garmin-cache] WARNING: {message}"),
     )
     enable_derived = _env_flag("GARMIN_CACHE_DERIVED")
     tiers = "exact+derived" if enable_derived else "exact"

@@ -142,18 +142,23 @@ them without new information** — the failures are upstream of this repo.
 is Garmin declining the request for this account rather than a bug in the call —
 no amount of parameter fiddling changes it.
 
-### `get_hrv_data` — needs re-verification, not debugging
+### `get_hrv_data` — closed by inspection, pending one live call
 
 Reported as an intermittent Pydantic validation error (`Input should be a valid
-string`, receiving a dict), succeeding on retry. That symptom is exactly what
-`_to_json_str` fixed in `6273370` (2026-07-29), which is an ancestor of every
-currently deployed ref — so either the observation predates the deploy, or the
-cause is something else.
+string`, receiving a dict), succeeding on retry. That symptom is MCP validating
+the tool's `-> str` return signature against a raw dict.
 
-Left in place because it has not been re-tested since. It is also not on the
-critical path: HRV arrives inside `get_sleep_data`, which is where the sleep
-analyst reads it. If someone does re-test, record the result here and delete
-this note either way.
+Traced through the code, that can no longer happen. `training.py:114-126`
+returns `_to_json_str(hrv_data)` on the success path and plain f-strings on the
+empty and error paths, so **every** branch returns a `str`; `_to_json_str`
+itself returns a string on all three of its own branches. `git log -L` confirms
+that the `_to_json_str` call on line 124 was introduced by `6273370`
+(2026-07-29) — the commit this note originally guessed at — which is an
+ancestor of every currently deployed ref.
+
+Not empirically re-tested, because that needs live Garmin credentials. One call
+against a settled date closes it: expect a JSON string, and no validation error.
+Record the result and delete this note either way.
 
 ### `get_sleep_data` — succeeds, but the result cannot be consumed
 
@@ -246,11 +251,22 @@ Depend on these freely:
 - `get_activity_hr_in_timezones`
 - `get_weigh_ins`
 
-### Long sessions
+### Long sessions and the API budget
 
-Many sequential calls in one session hit rate limiting or drop the MCP
-connection outright. For any backfill, prefer monthly chunks via
-`get_optimized_health_data` over per-day calls, and keep the call count per
-session modest. See the cache notes in [README.md](README.md#ingested-data-cache)
-for how much of this the ingested-data cache absorbs.
+**Garmin allows roughly 90-100 API calls per day for the whole account. Make
+only the calls you need.** Many sequential calls in one session hit rate
+limiting or drop the MCP connection outright.
+
+- Never use a range tool to fetch a single day — the per-day loops cost 5-7
+  calls for every day in the range.
+- For any backfill, prefer monthly chunks via `get_optimized_health_data` over
+  per-day calls.
+- Pass explicit include-lists to `get_trends` and `get_period_summary`; each
+  extra metric is another call per day of range.
+- Settled dates may be served from cache at no API cost; today and yesterday
+  never are.
+
+See [README.md](README.md#api-budget) for the full rules and
+[the cache notes](README.md#ingested-data-cache) for how much of this the
+ingested-data cache absorbs.
 
