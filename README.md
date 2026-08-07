@@ -565,17 +565,27 @@ OAuth tokens are automatically saved to `~/.garminconnect` (or path specified by
 2. **Connection refused**: Check firewall rules and port exposure
 3. **404 errors**: Ensure you're using the correct transport type (Streamable HTTP for network access)
 
-### Tools that fail no matter what you do
+### Tools that fail, and tools that lie
 
-Five registered tools fail consistently against Garmin and are **not** worth
-investigating: `get_trends`, `get_endurance_score`, `get_race_predictions`,
-`get_fitnessage_data` and `get_personal_record`. A sixth, `get_hrv_data`, has an
-older report that may already be fixed and needs re-verification rather than
-debugging.
-
-The table, the symptoms, and the list of endpoints confirmed stable are in
+Three separate failure modes, all catalogued in
 [TOOLS.md](TOOLS.md#known-broken-tools). Check there before spending time on a
-call that returns an error — the failures are upstream of this repo.
+call that misbehaves.
+
+**Fails outright, upstream of this repo — do not debug.** `get_trends`,
+`get_endurance_score`, `get_race_predictions`, `get_fitnessage_data`,
+`get_personal_record`. A sixth, `get_hrv_data`, has an older report that may
+already be fixed and needs re-verification rather than debugging.
+
+**Succeeds but cannot be consumed.** `get_sleep_data` returns ~280,000
+characters, which exceeds the MCP result limit. Two-thirds of that is per-minute
+time series; the summary a caller actually wants is about 1% of the payload.
+
+**Succeeds and returns a wrong answer.** `get_readiness_breakdown` reads HRV
+from a field live Garmin does not populate, so the component silently drops out;
+when it does resolve, the 20–100 ms scale rates a normal night at 20/100. It
+only looks correct against cached dates, because the cache flattens HRV to the
+field the code expects. This is the one worth fixing — a broken tool announces
+itself, this one does not.
 
 ### Kubernetes Issues
 

@@ -3,8 +3,9 @@
 This document lists all MCP tools available in the Garmin MCP Server.
 
 Registered is not the same as working. Read
-[Known-broken tools](#known-broken-tools) before depending on anything below —
-five of these fail consistently against Garmin and are not worth debugging.
+[Known-broken tools](#known-broken-tools) before depending on anything below.
+Five fail outright, one returns a payload too large to consume, and one returns
+a wrong number without erroring.
 
 ## Core Activity Tools (from __init__.py)
 - `list_activities(limit: int = 5)` - List recent Garmin activities
@@ -153,6 +154,59 @@ Left in place because it has not been re-tested since. It is also not on the
 critical path: HRV arrives inside `get_sleep_data`, which is where the sleep
 analyst reads it. If someone does re-test, record the result here and delete
 this note either way.
+
+### `get_sleep_data` — succeeds, but the result cannot be consumed
+
+Observed live:
+
+```
+Error: result (280,351 characters) exceeds maximum allowed tokens.
+```
+
+The Garmin call works. `health_wellness.py:281` returns the payload verbatim,
+and that payload is mostly per-minute time series that no summary consumer
+reads:
+
+| Field | Entries | Share of payload |
+|---|---:|---:|
+| `wellnessEpochSPO2DataDTOList` | 433 | 34.6% |
+| `sleepMovement` | 553 | 24.0% |
+| respiration epochs | 217 | 5.1% |
+| `sleepHeartRate` | 217 | 3.6% |
+| `sleepStress` / `sleepBodyBattery` | 145 each | 4.8% |
+| **`dailySleepDTO` — the actual summary** | — | **1.1%** |
+
+So an MCP client asking about last night gets an error and a spilled temp file
+instead of the 2.9 KB it wanted out of 250 KB. The cache does not help: it
+stores and serves the payload unmodified.
+
+This is why the sleep analyst reads raw payloads off disk rather than calling
+the tool. Anything that must go through MCP needs either a summary tool that
+returns Garmin's own `dailySleepDTO` scores and qualifiers, or an opt-in flag
+that drops the epoch series.
+
+### `get_readiness_breakdown` — returns a confident wrong number
+
+Two defects, both still present, and neither raises an error — which is what
+makes them worse than the broken list above.
+
+**The HRV component is dead on live data.** Five call sites read
+`hrv.get("avgHrv") or hrv.get("average")` — `recommendations.py` lines 753,
+856, 999, 1111 and 1182 — but live `get_hrv_data` nests the value at
+`hrvSummary.lastNightAvg`. It resolves to `None`, so readiness silently becomes
+a three-component average instead of four. It only populates when served from
+cache, because `cache.py:201` happens to flatten it to `avgHrv` — so the bug
+disappears exactly when you test against settled dates and reappears on today.
+
+**The scale is miscalibrated when it does work.** `recommendations.py:1114`
+maps 20 ms → 0 and 100 ms → 100. An overnight HRV of 36 ms scores **20/100**,
+while Garmin's own baseline calls the same night `BALANCED` and rates the HRV
+factor 96 `GOOD`. A good night is scored as near-total failure and drags the
+composite down with it.
+
+`get_training_readiness` already returns the shape this tool is trying to
+compute — score, `sleepScore`, `sleepHistoryFactorPercent` — in about 1 KB.
+That is the thing to copy, rather than deriving readiness from raw hours.
 
 ### Confirmed stable
 
