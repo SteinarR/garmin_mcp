@@ -538,10 +538,26 @@ that includes them. The cost is low — that call fetches a whole range in one
 request, unlike the per-day endpoints where each missing date costs its own
 call. Sleep has no gaps.
 
-Three calls in the per-day loops are still uncached because the ingestor does
-not collect them: `get_stress_data`, `get_max_metrics` and `get_heart_rates`.
-Covering them would need another ingestion category on the personal-ai side, at
-further API-call cost there.
+Three calls in the per-day loops are still uncached: `get_stress_data`,
+`get_max_metrics` and `get_heart_rates`. Two of them are genuinely uncollected,
+and covering those would need another ingestion category on the personal-ai
+side, at further API-call cost there.
+
+**`get_stress_data` is the exception, and it is cheap to fix.** The data is
+already on disk. `raw/stats/{date}.json` is stored verbatim and carries
+eighteen stress fields, including the one thing readiness actually reads:
+
+```
+averageStressLevel   maxStressLevel      stressQualifier
+stressDuration       restStressDuration  lowStressDuration
+highStressDuration   mediumStressDuration              (and ten more)
+```
+
+Confirmed on the server 2026-08-07: `averageStressLevel = 23` for a settled
+date. A derived `get_stress_data` mapped from the stored stats payload needs no
+new ingestion category and no additional API call anywhere. It would take a
+settled-date `get_readiness_breakdown` from one live Garmin request to zero,
+since stress is currently the only input to that tool the cache cannot serve.
 
 `get_activities` (most-recent-N) is deliberately never cached. It exists to
 return the newest activities, which is exactly the data a periodically-synced
@@ -849,6 +865,51 @@ Configure your MCP client (OpenWebUI, Claude, etc.) to connect to the `/mcp` end
 - **Token storage**: Tokens are stored locally/on PVC - ensure proper access controls
 - **Network security**: For production, use TLS/HTTPS (terminate at Ingress/Gateway)
 - **Secret rotation**: Rotate Garmin password regularly and update secrets accordingly
+
+## Outstanding work
+
+An index, not a spec — each item is described where it belongs, and this list
+exists only because the backlog was otherwise scattered across two files. Keep
+it short: delete an entry when it is done rather than marking it.
+
+**Costs API budget until fixed**
+
+- **Derive `get_stress_data` from the stored stats payload.** The data is
+  already on disk; this needs no new ingestion and no extra API call. It is the
+  only reason a settled-date `get_readiness_breakdown` still spends a live
+  request. See [Known coverage limits](#known-coverage-limits).
+- **Cap the unbounded date ranges.** The per-day loops accept any range and
+  have no ceiling, so one 365-day call can issue over a thousand requests. See
+  [Unbounded date ranges](#unbounded-date-ranges).
+
+**Tools that do not work**
+
+- **`get_sleep_data` cannot be consumed through MCP** — ~280,000 characters,
+  over the result limit, of which the summary is about 1%. Needs a summary tool
+  or a flag that drops the epoch series.
+- **Five tools fail upstream of this repo** and are marked do-not-debug.
+- **`upload_activity` is a stub** that returns "not supported" while `TOOLS.md`
+  advertises it. Implement or remove.
+
+All three are catalogued in [TOOLS.md](TOOLS.md#known-broken-tools).
+
+**Infrastructure**
+
+- **No CI.** There are 100+ offline tests and nothing runs them automatically.
+  `pyproject.toml` already excludes the credential-requiring scripts, so a
+  minimal `pytest` workflow is close to free. Note that one test skips as root.
+- **Detect the read-only mount at startup**, rather than on the first query
+  that touches the DB. The warning exists; it just fires late.
+
+**Depends on the ingestor (personal-ai), not actionable here**
+
+- `get_max_metrics` and `get_heart_rates` are genuinely uncollected and would
+  need a new ingestion category, at API cost there.
+- `daily_wellness` is off by default, which blocks exact-tier `get_stats` and
+  `get_body_battery`.
+- Only single-day `get_body_battery` is cached; wider ranges stay live.
+- Historical days keep the pre-2026-08-07 six-field training-state record and
+  are deliberately not backfilled.
 
 ## License
 

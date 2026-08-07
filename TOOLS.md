@@ -142,23 +142,20 @@ them without new information** — the failures are upstream of this repo.
 is Garmin declining the request for this account rather than a bug in the call —
 no amount of parameter fiddling changes it.
 
-### `get_hrv_data` — closed by inspection, pending one live call
+### `get_hrv_data` — CLOSED, was never broken after `6273370`
+
+Kept as a record because this note sat open for a while and should not be
+reopened from the original report.
 
 Reported as an intermittent Pydantic validation error (`Input should be a valid
-string`, receiving a dict), succeeding on retry. That symptom is MCP validating
-the tool's `-> str` return signature against a raw dict.
+string`, receiving a dict) that succeeded on retry — MCP validating the tool's
+`-> str` return signature against a raw dict. `training.py:114-126` returns
+`_to_json_str(hrv_data)` on the success path and f-strings on the empty and
+error paths, so every branch returns a `str`. That call was introduced by
+`6273370` (2026-07-29), so the failure has been impossible since.
 
-Traced through the code, that can no longer happen. `training.py:114-126`
-returns `_to_json_str(hrv_data)` on the success path and plain f-strings on the
-empty and error paths, so **every** branch returns a `str`; `_to_json_str`
-itself returns a string on all three of its own branches. `git log -L` confirms
-that the `_to_json_str` call on line 124 was introduced by `6273370`
-(2026-07-29) — the commit this note originally guessed at — which is an
-ancestor of every currently deployed ref.
-
-Not empirically re-tested, because that needs live Garmin credentials. One call
-against a settled date closes it: expect a JSON string, and no validation error.
-Record the result and delete this note either way.
+Confirmed live twice against the deployed build, 2026-08-07: clean JSON string,
+no validation error. Do not spend time on it again without a *new* report.
 
 ### `get_sleep_data` — succeeds, but the result cannot be consumed
 
@@ -290,12 +287,18 @@ Two things about how this was found are worth keeping:
 
 Depend on these freely:
 
-- `get_sleep_data` (single date)
 - `get_optimized_health_data` (date ranges)
 - `get_activities_by_date` / `get_activities_fordate`
 - `get_activity_splits`
 - `get_activity_hr_in_timezones`
 - `get_weigh_ins`
+
+`get_sleep_data` used to be listed here as well, which contradicted its own
+entry above. Both halves were true in different senses — the Garmin call is
+reliable, the MCP round-trip blows the result limit — but "depend on it freely"
+is the wrong advice for a tool that errors every time it is called through MCP.
+It is reliable as a *data source on disk*, which is how the sleep analyst uses
+it; it is not usable as an MCP tool until the payload is trimmed.
 
 ### Long sessions and the API budget
 
