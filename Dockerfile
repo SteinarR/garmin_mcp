@@ -1,6 +1,9 @@
 # Container image for running the Garmin MCP server
 
-FROM ghcr.io/astral-sh/uv:0.4.20-python3.12-bookworm AS base
+# uv 0.4.20 predates lockfile `revision`, so `uv sync --frozen` silently
+# rewrote uv.lock during the build instead of honouring it. Keep this at or
+# above the version that wrote the committed lock (see `revision` in uv.lock).
+FROM ghcr.io/astral-sh/uv:0.8.17-python3.12-bookworm AS base
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1

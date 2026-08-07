@@ -37,6 +37,12 @@ SOURCE_VALUE = "garmin-ingestor-cache"
 # cache regardless of the configured floor.
 TRAINING_STATE_MIN_AGE_DAYS = 2
 
+# Window used to build a personal HRV baseline from stored sleep payloads.
+# Roughly matches the span Garmin's own baseline covers, and each day costs one
+# large JSON parse, so results are memoised.
+HRV_HISTORY_DAYS = 60
+HRV_HISTORY_MEMO_MAX = 32
+
 
 def _default_warning(message):
     print(f"[garmin-cache] WARNING: {message}")
@@ -91,6 +97,7 @@ class GarminCache:
         # stay off in normal operation.
         self._on_warning = on_warning if callable(on_warning) else _default_warning
         self._warned = set()
+        self._hrv_history_memo = {}
 
     # -- bookkeeping ------------------------------------------------------
 
@@ -263,6 +270,49 @@ class GarminCache:
         if isinstance(payload.get("hrvData"), list):
             result["hrvReadings"] = payload["hrvData"]
         return result
+
+    def hrv_history(self, end_day, days=HRV_HISTORY_DAYS):
+        """Overnight HRV values from the stored sleep payloads, oldest first.
+
+        Reads disk and nothing else. There is deliberately no live fallback:
+        callers use this to build a personal baseline, and quietly turning that
+        into `days` Garmin requests would blow the daily API budget outright.
+
+        Days with no stored payload are skipped rather than interpolated, so a
+        gappy window yields fewer values instead of wrong ones.
+        """
+        end_day = _as_date(end_day)
+        if end_day is None:
+            return []
+        days = max(1, int(days))
+        key = (end_day.isoformat(), days)
+        with self._lock:
+            hit = self._hrv_history_memo.get(key)
+        if hit is not None:
+            return list(hit)
+
+        values = []
+        # Start at the day before `end_day`: a baseline should not include the
+        # night it is being used to judge.
+        for offset in range(1, days + 1):
+            day = end_day - datetime.timedelta(days=offset)
+            payload = self.read_raw("sleep", day.isoformat())
+            if not isinstance(payload, dict):
+                continue
+            value = payload.get("avgOvernightHrv")
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            values.append(float(value))
+        values.reverse()
+
+        with self._lock:
+            # Each entry parses up to `days` sleep payloads, which are large.
+            # Bound the memo rather than let a long-lived process accumulate one
+            # entry per date ever queried.
+            if len(self._hrv_history_memo) >= HRV_HISTORY_MEMO_MAX:
+                self._hrv_history_memo.clear()
+            self._hrv_history_memo[key] = list(values)
+        return values
 
     def _daily_training_state(self, day):
         payload = self.read_raw("daily_training_state", day.isoformat())

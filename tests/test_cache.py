@@ -529,3 +529,47 @@ def test_readonly_directory_reproduced_end_to_end(tmp_path, data_dir):
     finally:
         db_dir.chmod(0o755)
     assert seen and "read-only" in seen[0]
+
+
+# -- HRV history for personal baselines -----------------------------------
+
+
+def test_hrv_history_reads_stored_sleep_only(data_dir, db_path):
+    cache = GarminCache(data_dir=data_dir, db_path=db_path, min_age_days=1)
+    values = cache.hrv_history(TODAY, days=30)
+    # The fixture writes one settled day, carrying avgOvernightHrv 62.
+    assert values == [62.0]
+
+
+def test_hrv_history_excludes_the_day_being_scored(data_dir, db_path):
+    cache = GarminCache(data_dir=data_dir, db_path=db_path, min_age_days=1)
+    # SETTLED itself must not appear in its own baseline.
+    assert cache.hrv_history(SETTLED, days=30) == []
+    assert cache.hrv_history(SETTLED + datetime.timedelta(days=1), days=30) == [62.0]
+
+
+def test_hrv_history_memoises_repeat_windows(data_dir, db_path, monkeypatch):
+    cache = GarminCache(data_dir=data_dir, db_path=db_path, min_age_days=1)
+    reads = []
+    original = cache._read_json
+    monkeypatch.setattr(cache, "_read_json", lambda p: (reads.append(p), original(p))[1])
+    cache.hrv_history(TODAY, days=30)
+    first = len(reads)
+    cache.hrv_history(TODAY, days=30)
+    assert len(reads) == first, "second call re-parsed the sleep payloads"
+
+
+def test_hrv_history_handles_a_missing_data_dir(tmp_path):
+    cache = GarminCache(data_dir=tmp_path / "nope", min_age_days=1)
+    assert cache.hrv_history(TODAY, days=30) == []
+
+
+def test_hrv_history_rejects_an_unparseable_date(data_dir):
+    cache = GarminCache(data_dir=data_dir, min_age_days=1)
+    assert cache.hrv_history("not-a-date") == []
+
+
+def test_hrv_history_is_exposed_on_the_wrapper(client):
+    cached, live = client
+    assert cached.hrv_history(TODAY, days=30) == [62.0]
+    assert live.calls == [], "history must never reach the live client"

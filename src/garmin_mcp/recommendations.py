@@ -185,6 +185,11 @@ def _resolve_anchor_period(period: str, anchor_value: Optional[str]) -> Tuple[da
     return start, end, anchor_used
 
 
+# Fewer nights than this and the percentile bands are noise, so scoring falls
+# through to the population scale rather than inventing a confident baseline.
+HRV_HISTORY_MIN_SAMPLES = 14
+
+
 def _first_number(*values: Any) -> Optional[float]:
     """First value that is a real number. Unlike `a or b`, a legitimate 0 wins."""
     for value in values:
@@ -293,6 +298,59 @@ def _extract_hrv_baseline(hrv: Any) -> Optional[Dict[str, float]]:
         "balanced_low": balanced_low,
         "balanced_upper": balanced_upper,
     }
+
+
+def _percentile(ordered: List[float], fraction: float) -> float:
+    """Linear-interpolated percentile of an already-sorted list."""
+    if len(ordered) == 1:
+        return ordered[0]
+    position = fraction * (len(ordered) - 1)
+    low = int(position)
+    high = min(low + 1, len(ordered) - 1)
+    return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
+
+
+def _baseline_from_history(values: List[float]) -> Optional[Dict[str, float]]:
+    """Personal HRV bands derived from the user's own recent nights.
+
+    Used when live Garmin supplied no baseline — which is every cached date,
+    since the ingestor stores no HRV endpoint response for one to come from.
+    The alternative there is a fixed millisecond scale, and that is what rated a
+    genuinely good night 20/100 in the first place: someone whose normal sits at
+    30-40 ms is not unhealthy, they just are not the population median.
+
+    The percentiles stand in for Garmin's own zones — the middle half of your
+    nights is 'balanced', the bottom tenth is 'low'.
+    """
+    if len(values) < HRV_HISTORY_MIN_SAMPLES:
+        return None
+    ordered = sorted(values)
+    baseline = {
+        "low_upper": _percentile(ordered, 0.10),
+        "balanced_low": _percentile(ordered, 0.25),
+        "balanced_upper": _percentile(ordered, 0.75),
+    }
+    if baseline["balanced_upper"] <= baseline["balanced_low"]:
+        return None
+    return baseline
+
+
+def _hrv_history_baseline(client: Any, day: Optional[datetime.date]) -> Optional[Dict[str, float]]:
+    """Baseline from stored history, when the client exposes any.
+
+    `hrv_history` exists only on the cached client wrapper and reads disk only.
+    An uncached deployment has no attribute here and gets None, which is the
+    point: this must never turn into one Garmin call per day of window.
+    """
+    if day is None:
+        return None
+    history = getattr(client, "hrv_history", None)
+    if not callable(history):
+        return None
+    try:
+        return _baseline_from_history(history(day))
+    except Exception:
+        return None
 
 
 def _score_hrv_against_baseline(value: float, baseline: Dict[str, float]) -> float:
@@ -1284,10 +1342,16 @@ def register_tools(app):
                     hrv_score = _score_hrv_against_baseline(hrv_value, baseline)
                     hrv_method = "personal_baseline"
                 elif hrv_value is not None:
-                    # No baseline to compare against. This is a coarse population
-                    # scale and will misjudge anyone whose normal sits outside it.
-                    hrv_score = max(0.0, min(100.0, (hrv_value - 20.0) / (70.0 - 20.0) * 100.0))
-                    hrv_method = "population_scale_approximate"
+                    history_baseline = _hrv_history_baseline(garmin_client, resolved_date)
+                    if history_baseline is not None:
+                        hrv_score = _score_hrv_against_baseline(hrv_value, history_baseline)
+                        hrv_method = "personal_baseline_from_history"
+                    else:
+                        # Nothing personal to compare against. A coarse
+                        # population scale, and it will misjudge anyone whose
+                        # normal sits outside it.
+                        hrv_score = max(0.0, min(100.0, (hrv_value - 20.0) / (70.0 - 20.0) * 100.0))
+                        hrv_method = "population_scale_approximate"
             except Exception:
                 pass
 

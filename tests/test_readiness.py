@@ -14,6 +14,7 @@ import pytest
 from garmin_mcp import recommendations
 from garmin_mcp.recommendations import (
     _average_body_battery,
+    _baseline_from_history,
     _extract_body_battery_levels,
     _extract_hrv_baseline,
     _extract_hrv_value,
@@ -481,3 +482,92 @@ def test_period_summary_aggregates_body_battery(tools):
         "get_period_summary", WithActivities(), "daily", RANGE_START, True, True, True, True, True, True
     )
     assert result["aggregates"]["avg_body_battery"] == 75.0
+
+
+# --- Personal baseline from stored history --------------------------------
+#
+# Cached dates carry no hrvSummary.baseline, because the ingestor stores no HRV
+# endpoint response for one to come from. Before this, they fell to a fixed
+# 20-70ms scale that rated a real 40ms night 40/100 where Garmin said 94.
+
+# Roughly the distribution behind the server's observed 29-40ms readings.
+HISTORY = [26, 28, 29, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 42, 44, 46]
+
+
+class HistoryClient(StubClient):
+    """A cached client: exposes hrv_history, which reads disk and never Garmin."""
+
+    def __init__(self, history=None, **kwargs):
+        super().__init__(**kwargs)
+        self._history = HISTORY if history is None else history
+        self.history_calls = 0
+
+    def hrv_history(self, end_day, days=None):
+        self.history_calls += 1
+        return list(self._history)
+
+
+def test_history_baseline_bands_come_from_percentiles():
+    baseline = _baseline_from_history(HISTORY)
+    assert baseline["low_upper"] < baseline["balanced_low"] < baseline["balanced_upper"]
+    assert baseline["balanced_low"] == pytest.approx(30.25)
+    assert baseline["balanced_upper"] == pytest.approx(38.75)
+
+
+def test_history_baseline_needs_enough_nights():
+    assert _baseline_from_history([30, 31, 32]) is None
+    assert _baseline_from_history([]) is None
+
+
+def test_history_baseline_rejects_a_flat_series():
+    """Thirty identical readings describe no band worth scoring against."""
+    assert _baseline_from_history([33.0] * 30) is None
+
+
+def test_history_baseline_rescues_the_underrated_night():
+    """40ms scored 40 on the population scale; Garmin's own factor called it 94."""
+    baseline = _baseline_from_history(HISTORY)
+    population = (40.0 - 20.0) / (70.0 - 20.0) * 100.0
+    assert population == 40.0
+    assert _score_hrv_against_baseline(40.0, baseline) > 90.0
+
+
+def test_history_baseline_used_when_payload_has_none(breakdown):
+    client = HistoryClient(hrv=cached_hrv(40))
+    result = breakdown(client)
+    assert result["hrv_scoring_method"] == "personal_baseline_from_history"
+    assert result["components"]["hrv_score"] > 90.0
+    assert client.history_calls == 1
+
+
+def test_live_baseline_still_preferred_over_history(breakdown):
+    result = breakdown(HistoryClient(hrv=live_hrv(36)))
+    assert result["hrv_scoring_method"] == "personal_baseline"
+
+
+def test_garmin_factor_still_beats_both(breakdown):
+    client = HistoryClient(hrv=live_hrv(36), readiness=[{"score": 72, "hrvFactorPercent": 96}])
+    result = breakdown(client)
+    assert result["hrv_scoring_method"] == "garmin_hrv_factor"
+    assert client.history_calls == 0
+
+
+def test_population_scale_when_history_is_too_short(breakdown):
+    result = breakdown(HistoryClient(history=[30, 31, 32], hrv=cached_hrv(40)))
+    assert result["hrv_scoring_method"] == "population_scale_approximate"
+
+
+def test_uncached_client_never_gets_history(breakdown):
+    """A plain client has no hrv_history, so nothing can fan out into API calls."""
+    result = breakdown(StubClient(hrv=cached_hrv(40)))
+    assert result["hrv_scoring_method"] == "population_scale_approximate"
+
+
+def test_history_failure_falls_through_quietly(breakdown):
+    class Exploding(HistoryClient):
+        def hrv_history(self, end_day, days=None):
+            raise RuntimeError("disk gone")
+
+    result = breakdown(Exploding(hrv=cached_hrv(40)))
+    assert result["hrv_scoring_method"] == "population_scale_approximate"
+    assert result["components"]["hrv_score"] == 40.0

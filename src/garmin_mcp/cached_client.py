@@ -76,6 +76,17 @@ class CachedGarminClient:
     def cache_stats(self):
         return dict(self._cache.stats)
 
+    def hrv_history(self, end_day, days=None):
+        """Stored overnight HRV values, for callers building a personal baseline.
+
+        Present only on this wrapper, so an uncached deployment simply does not
+        offer it and callers fall back. It reads disk and never the live client,
+        so it costs no Garmin requests.
+        """
+        if days is None:
+            return self._cache.hrv_history(end_day)
+        return self._cache.hrv_history(end_day, days)
+
     def _log(self, message):
         if self._verbose:
             print(f"[garmin-cache] {message}")
