@@ -54,8 +54,9 @@ def _is_readonly_directory_error(exc):
     while nothing else is connected, the files go away, and every query here
     starts failing — silently, as a fallback to the live Garmin API.
     """
-    # sqlite_errorname needs Python 3.11; pyproject allows 3.10, hence the
-    # message fallback.
+    # sqlite3 sets sqlite_errorname only on exceptions it raises itself; one
+    # constructed by hand (a test, a re-raise) carries the message and nothing
+    # else. Hence the fallback — it is not about Python version support.
     name = getattr(exc, "sqlite_errorname", None)
     if name is not None:
         return name == "SQLITE_READONLY_DIRECTORY"

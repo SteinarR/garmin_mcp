@@ -25,7 +25,7 @@ Credits: https://github.com/Taxuspt/garmin_mcp
 
 ## Prerequisites
 
-- Python 3.10+ (3.12 recommended)
+- Python 3.12+ (the container image and the deployed runtime are 3.12)
 - Garmin Connect account credentials
 - For Kubernetes: kubectl access to your cluster
 
