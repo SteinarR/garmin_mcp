@@ -507,6 +507,11 @@ just six normalized fields and discard the rest, which cost `hrvFactorPercent`
 among others. Earlier days are not backfilled — re-fetching 730 days would cost
 one Garmin call each — so they fall back to the derived form below.
 
+Their tier is therefore decided per day, by what is actually on disk, not per
+method: a stored verbatim payload is exact and served regardless of
+`GARMIN_CACHE_DERIVED`, while the normalized reconstruction honours that flag
+like everything else in the derived tier.
+
 **Derived** (`GARMIN_CACHE_DERIVED`) — the ingestor normalizes these, so the
 response carries only the retained fields and is tagged `"_partial": true`:
 

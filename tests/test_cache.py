@@ -656,3 +656,59 @@ def test_training_status_falls_back_to_six_field_form(tmp_path, data_dir):
     result = cache.get_training_status(SETTLED)
     assert result["acuteLoad"] == 210
     assert result["_partial"] is True
+
+
+# -- tier is decided per payload, not per method ---------------------------
+#
+# PR #4 review, Medium: listing these only under DERIVED_METHODS meant a stored
+# verbatim payload was discarded whenever GARMIN_CACHE_DERIVED was off, and the
+# call went to Garmin despite an exact copy sitting on disk.
+
+
+def _client_with_training_state(data_dir, db_path, extra, derived):
+    _write(
+        data_dir / "raw" / "daily_training_state" / f"{SETTLED.isoformat()}.json",
+        {
+            "calendarDate": SETTLED.isoformat(),
+            "trainingReadiness": 62,
+            "trainingStatusCode": 3,
+            **extra,
+        },
+    )
+    cache = GarminCache(data_dir=data_dir, db_path=db_path, min_age_days=1)
+    live = FakeClient()
+    return CachedGarminClient(live, cache, enable_derived=derived), live
+
+
+def test_verbatim_readiness_served_with_derived_tier_off(data_dir, db_path):
+    cached, live = _client_with_training_state(
+        data_dir,
+        db_path,
+        {"trainingReadinessRaw": {"score": 62, "hrvFactorPercent": 94}},
+        derived=False,
+    )
+    result = cached.get_training_readiness(SETTLED.isoformat())
+    assert result["hrvFactorPercent"] == 94
+    assert live.calls == [], "an exact copy was on disk; this must not hit Garmin"
+
+
+def test_derived_readiness_still_gated_with_derived_tier_off(data_dir, db_path):
+    cached, live = _client_with_training_state(data_dir, db_path, {}, derived=False)
+    cached.get_training_readiness(SETTLED.isoformat())
+    assert live.calls, "the normalized reconstruction is derived and must be gated"
+
+
+def test_derived_readiness_served_when_derived_tier_on(data_dir, db_path):
+    cached, live = _client_with_training_state(data_dir, db_path, {}, derived=True)
+    result = cached.get_training_readiness(SETTLED.isoformat())
+    assert result["trainingReadiness"] == 62
+    assert live.calls == []
+
+
+def test_verbatim_status_served_with_derived_tier_off(data_dir, db_path):
+    cached, live = _client_with_training_state(
+        data_dir, db_path, {"trainingStatusRaw": {"trainingStatusCode": 3, "extra": "kept"}},
+        derived=False,
+    )
+    assert cached.get_training_status(SETTLED.isoformat())["extra"] == "kept"
+    assert live.calls == []

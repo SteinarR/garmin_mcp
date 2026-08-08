@@ -19,7 +19,7 @@ Design rules:
 import datetime
 import os
 
-from garmin_mcp.cache import GarminCache, _as_date
+from garmin_mcp.cache import PARTIAL_KEY, GarminCache, _as_date
 
 # Payloads stored verbatim by the ingestor; tools cannot distinguish these from
 # a live response.
@@ -38,6 +38,16 @@ DERIVED_METHODS = (
     "get_training_readiness",
     "get_training_status",
     "get_body_composition",
+)
+
+# Methods whose tier is decided per day rather than up front. The ingestor
+# started storing the untouched training-state responses on 2026-08-07, so a
+# recent day is exact and an older one is the normalized reconstruction. Listing
+# them only under DERIVED_METHODS would have thrown away a stored verbatim
+# payload whenever GARMIN_CACHE_DERIVED was off, and gone to Garmin instead.
+TIER_DEPENDS_ON_PAYLOAD = (
+    "get_training_readiness",
+    "get_training_status",
 )
 
 
@@ -93,7 +103,7 @@ class CachedGarminClient:
 
     def _serve(self, method, day, loader, min_age_days=None):
         """Try the cache for a single-date read, else fall back to the live client."""
-        if method not in self._enabled:
+        if method not in self._enabled and method not in TIER_DEPENDS_ON_PAYLOAD:
             return None
         parsed = _as_date(day)
         if parsed is None:
@@ -115,6 +125,18 @@ class CachedGarminClient:
         if result is None:
             self._cache._count("miss")
             self._log(f"{method} {parsed} miss")
+            return None
+        # For the payload-dependent methods the tier is not a property of the
+        # call but of what the ingestor happened to store that day. A verbatim
+        # response is exact and always eligible; the normalized reconstruction
+        # is derived and honours GARMIN_CACHE_DERIVED like the rest.
+        if (
+            method in TIER_DEPENDS_ON_PAYLOAD
+            and not self._enable_derived
+            and isinstance(result, dict)
+            and result.get(PARTIAL_KEY)
+        ):
+            self._log(f"{method} {parsed} bypass (derived payload, derived tier off)")
             return None
         self._cache._count("hit")
         self._log(f"{method} {parsed} hit")

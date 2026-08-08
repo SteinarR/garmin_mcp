@@ -210,7 +210,7 @@ trustworthiness, reported per call in `hrv_scoring_method`:
 |---|---|---|
 | `garmin_hrv_factor` | `hrvFactorPercent` from `get_training_readiness` | Live, and Garmin supplies the factor |
 | `personal_baseline` | `hrvSummary.baseline` — the user's own balanced band | Live, no factor available |
-| `personal_baseline_from_history` | Percentile bands over stored overnight HRV | Cached dates, ≥14 nights on disk |
+| `stored_history_approximate` | Percentile bands over stored overnight HRV | Cached dates, ≥28 nights on disk |
 | `population_scale_approximate` | Fixed 20-70 ms map | Last resort: no cache, or too little history |
 
 The history tier exists because cached dates carry no HRV baseline — the
@@ -231,6 +231,16 @@ cached wrapper — an uncached deployment has no such attribute and falls throug
 to the population scale. That is deliberate: fanning a baseline out into one
 Garmin call per day of window would exhaust the daily budget in a single tool
 call.
+
+**Treat `stored_history_approximate` as weaker than its neighbours.** The bands
+are percentiles of the user's own recent nights, so they carry two structural
+flaws: defining the middle 50% as "balanced" guarantees a quarter of an
+otherwise stable period reads below balanced, and a sustained decline drags the
+baseline down with it until poor readings look normal. It exists because the
+alternative on cached dates is a fixed millisecond scale that is worse. The
+sample count behind any given score is reported as `hrv_baseline_samples`;
+below 28 nights the tier declines to score at all and hands off to the
+population scale.
 
 On the recorded 36 ms night that scored 20: it now scores 96 via Garmin's own
 factor, or 60 against the personal baseline when the factor is absent.

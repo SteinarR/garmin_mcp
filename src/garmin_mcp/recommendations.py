@@ -3,6 +3,7 @@ Training and Diet Recommendations functions for Garmin Connect MCP Server
 """
 import datetime
 import json
+import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 # The garmin_client will be set by the main file
@@ -187,7 +188,11 @@ def _resolve_anchor_period(period: str, anchor_value: Optional[str]) -> Tuple[da
 
 # Fewer nights than this and the percentile bands are noise, so scoring falls
 # through to the population scale rather than inventing a confident baseline.
-HRV_HISTORY_MIN_SAMPLES = 14
+# At 14 the 10th percentile is decided almost entirely by the second and third
+# lowest readings, which is not a baseline so much as a rumour; 28 gives the
+# quartiles something to work with and matches the span Garmin's own baseline
+# covers.
+HRV_HISTORY_MIN_SAMPLES = 28
 
 
 def _first_number(*values: Any) -> Optional[float]:
@@ -214,8 +219,11 @@ def _body_battery_level_index(day: Dict[str, Any]) -> int:
                 continue
             key = descriptor.get("bodyBatteryValueDescriptorKey")
             index = descriptor.get("bodyBatteryValueDescriptorIndex")
-            if key == "bodyBatteryLevel" and isinstance(index, int):
-                return index
+            if key != "bodyBatteryLevel":
+                continue
+            if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+                break
+            return index
     return 2
 
 
@@ -243,7 +251,9 @@ def _extract_body_battery_levels(payload: Any) -> List[float]:
             continue
         index = _body_battery_level_index(day)
         for row in rows:
-            if isinstance(row, (list, tuple)) and len(row) > index:
+            # Reject a negative index rather than let it wrap: -1 would read the
+            # version column and report it as a battery level.
+            if isinstance(row, (list, tuple)) and 0 <= index < len(row):
                 value = _first_number(row[index])
                 if value is not None:
                     levels.append(value)
@@ -291,10 +301,29 @@ def _extract_hrv_baseline(hrv: Any) -> Optional[Dict[str, float]]:
     low_upper = _first_number(baseline.get("lowUpper"))
     balanced_low = _first_number(baseline.get("balancedLow"))
     balanced_upper = _first_number(baseline.get("balancedUpper"))
-    if balanced_low is None or balanced_upper is None or balanced_upper <= balanced_low:
+    if balanced_low is None or balanced_upper is None:
+        return None
+    if low_upper is None:
+        low_upper = balanced_low
+    return _validated_band(low_upper, balanced_low, balanced_upper)
+
+
+def _validated_band(
+    low_upper: float, balanced_low: float, balanced_upper: float
+) -> Optional[Dict[str, float]]:
+    """A band the scorer can use, or None.
+
+    The scoring segments assume a finite, correctly ordered band. A misordered
+    or non-finite one does not raise — it silently yields a nonsense score, or
+    NaN, which then averages into readiness looking like a real number.
+    """
+    values = (low_upper, balanced_low, balanced_upper)
+    if not all(math.isfinite(v) for v in values):
+        return None
+    if not 0 < low_upper <= balanced_low < balanced_upper:
         return None
     return {
-        "low_upper": low_upper if low_upper is not None else balanced_low,
+        "low_upper": low_upper,
         "balanced_low": balanced_low,
         "balanced_upper": balanced_upper,
     }
@@ -324,33 +353,35 @@ def _baseline_from_history(values: List[float]) -> Optional[Dict[str, float]]:
     """
     if len(values) < HRV_HISTORY_MIN_SAMPLES:
         return None
-    ordered = sorted(values)
-    baseline = {
-        "low_upper": _percentile(ordered, 0.10),
-        "balanced_low": _percentile(ordered, 0.25),
-        "balanced_upper": _percentile(ordered, 0.75),
-    }
-    if baseline["balanced_upper"] <= baseline["balanced_low"]:
+    ordered = sorted(v for v in values if math.isfinite(v))
+    if len(ordered) < HRV_HISTORY_MIN_SAMPLES:
         return None
-    return baseline
+    return _validated_band(
+        _percentile(ordered, 0.10),
+        _percentile(ordered, 0.25),
+        _percentile(ordered, 0.75),
+    )
 
 
-def _hrv_history_baseline(client: Any, day: Optional[datetime.date]) -> Optional[Dict[str, float]]:
-    """Baseline from stored history, when the client exposes any.
+def _hrv_history_values(client: Any, day: Optional[datetime.date]) -> List[float]:
+    """Stored overnight HRV values, when the client exposes any.
 
     `hrv_history` exists only on the cached client wrapper and reads disk only.
-    An uncached deployment has no attribute here and gets None, which is the
+    An uncached deployment has no attribute here and gets nothing, which is the
     point: this must never turn into one Garmin call per day of window.
     """
     if day is None:
-        return None
+        return []
     history = getattr(client, "hrv_history", None)
     if not callable(history):
-        return None
+        return []
     try:
-        return _baseline_from_history(history(day))
+        values = history(day)
     except Exception:
-        return None
+        return []
+    if not isinstance(values, list):
+        return []
+    return [v for v in values if not isinstance(v, bool) and isinstance(v, (int, float))]
 
 
 def _score_hrv_against_baseline(value: float, baseline: Dict[str, float]) -> float:
@@ -676,10 +707,13 @@ def register_tools(app):
             # Analyze training readiness
             readiness_scores = []
             for day in daily_summary:
-                readiness = day.get("training_readiness")
-                if readiness and isinstance(readiness, dict):
-                    if "trainingReadiness" in readiness:
-                        readiness_scores.append(readiness.get("trainingReadiness", {}).get("value", 0))
+                # Handles every shape the cache and the live client produce: a
+                # list, a raw dict with top-level `score`, the nested dict, and
+                # the derived scalar. Reading .get("value") off that last one
+                # raised, since the scalar is an int.
+                score = _garmin_readiness_score(day.get("training_readiness"))
+                if score is not None:
+                    readiness_scores.append(score)
             
             if readiness_scores:
                 avg_readiness = sum(readiness_scores) / len(readiness_scores)
@@ -955,11 +989,9 @@ def register_tools(app):
                     try:
                         tr = garmin_client.get_training_readiness(d)
                         day["training_readiness"] = tr if tr else None
-                        if isinstance(tr, dict):
-                            if "trainingReadiness" in tr and isinstance(tr["trainingReadiness"], dict):
-                                val = tr["trainingReadiness"].get("value")
-                                if isinstance(val, (int, float)):
-                                    readiness_values.append(float(val))
+                        score = _garmin_readiness_score(tr)
+                        if score is not None:
+                            readiness_values.append(score)
                     except Exception:
                         day["training_readiness"] = None
 
@@ -1326,34 +1358,45 @@ def register_tools(app):
             except Exception:
                 pass
 
-            # HRV, in descending order of trustworthiness: Garmin's own factor,
-            # then the user's personal baseline, then a population-scale guess.
-            hrv_score = None
-            hrv_value = None
-            hrv_method = None
+            # Fetch HRV for the reported measurement and for the lower-priority
+            # scoring paths. Kept in its own try: scoring below must not depend
+            # on this succeeding, or a failure here would discard a Garmin
+            # factor already in hand.
+            hrv = None
             try:
                 hrv = garmin_client.get_hrv_data(date_str)
-                hrv_value = _extract_hrv_value(hrv)
-                baseline = _extract_hrv_baseline(hrv)
-                if garmin_hrv_factor is not None:
-                    hrv_score = max(0.0, min(100.0, garmin_hrv_factor))
-                    hrv_method = "garmin_hrv_factor"
-                elif hrv_value is not None and baseline is not None:
-                    hrv_score = _score_hrv_against_baseline(hrv_value, baseline)
-                    hrv_method = "personal_baseline"
-                elif hrv_value is not None:
-                    history_baseline = _hrv_history_baseline(garmin_client, resolved_date)
-                    if history_baseline is not None:
-                        hrv_score = _score_hrv_against_baseline(hrv_value, history_baseline)
-                        hrv_method = "personal_baseline_from_history"
-                    else:
-                        # Nothing personal to compare against. A coarse
-                        # population scale, and it will misjudge anyone whose
-                        # normal sits outside it.
-                        hrv_score = max(0.0, min(100.0, (hrv_value - 20.0) / (70.0 - 20.0) * 100.0))
-                        hrv_method = "population_scale_approximate"
             except Exception:
                 pass
+            hrv_value = _extract_hrv_value(hrv)
+            baseline = _extract_hrv_baseline(hrv)
+
+            # Score in descending order of trustworthiness.
+            hrv_score = None
+            hrv_method = None
+            hrv_baseline_samples = None
+            if garmin_hrv_factor is not None:
+                hrv_score = max(0.0, min(100.0, garmin_hrv_factor))
+                hrv_method = "garmin_hrv_factor"
+            elif hrv_value is not None and baseline is not None:
+                hrv_score = _score_hrv_against_baseline(hrv_value, baseline)
+                hrv_method = "personal_baseline"
+            elif hrv_value is not None:
+                history = _hrv_history_values(garmin_client, resolved_date)
+                history_baseline = _baseline_from_history(history)
+                if history_baseline is not None:
+                    hrv_baseline_samples = len(history)
+                    hrv_score = _score_hrv_against_baseline(hrv_value, history_baseline)
+                    # Named approximate on purpose: the bands are percentiles of
+                    # this user's own recent nights, so a sustained decline drags
+                    # the baseline down with it and poor readings start to look
+                    # normal. Prefer garmin_hrv_factor wherever it is available.
+                    hrv_method = "stored_history_approximate"
+                else:
+                    # Nothing personal to compare against. A coarse population
+                    # scale, and it will misjudge anyone whose normal sits
+                    # outside it.
+                    hrv_score = max(0.0, min(100.0, (hrv_value - 20.0) / (70.0 - 20.0) * 100.0))
+                    hrv_method = "population_scale_approximate"
 
             # Stress inverse (if daily value present)
             stress_score = None
@@ -1389,6 +1432,7 @@ def register_tools(app):
                 "components_missing": missing,
                 "hrv_ms": hrv_value,
                 "hrv_scoring_method": hrv_method,
+                "hrv_baseline_samples": hrv_baseline_samples,
                 "readiness_score": readiness,
                 "garmin_training_readiness": garmin_readiness,
             })
@@ -1544,10 +1588,9 @@ def register_tools(app):
                 # readiness
                 try:
                     tr = garmin_client.get_training_readiness(d)
-                    if isinstance(tr, dict) and "trainingReadiness" in tr and isinstance(tr["trainingReadiness"], dict):
-                        val = tr["trainingReadiness"].get("value")
-                        if isinstance(val, (int, float)):
-                            readiness_scores.append(float(val))
+                    score = _garmin_readiness_score(tr)
+                    if score is not None:
+                        readiness_scores.append(score)
                 except Exception:
                     pass
                 # steps

@@ -491,7 +491,13 @@ def test_period_summary_aggregates_body_battery(tools):
 # 20-70ms scale that rated a real 40ms night 40/100 where Garmin said 94.
 
 # Roughly the distribution behind the server's observed 29-40ms readings.
-HISTORY = [26, 28, 29, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 42, 44, 46]
+# 30 nights: the floor is 28, since at 14 the 10th percentile is decided by
+# the second and third lowest readings alone.
+HISTORY = [
+    26, 27, 28, 28, 29, 29, 30, 30, 31, 31,
+    32, 32, 33, 33, 34, 34, 35, 35, 36, 36,
+    37, 38, 38, 39, 40, 41, 42, 43, 44, 46,
+]
 
 
 class HistoryClient(StubClient):
@@ -510,12 +516,14 @@ class HistoryClient(StubClient):
 def test_history_baseline_bands_come_from_percentiles():
     baseline = _baseline_from_history(HISTORY)
     assert baseline["low_upper"] < baseline["balanced_low"] < baseline["balanced_upper"]
+    assert baseline["low_upper"] == pytest.approx(28.0)
     assert baseline["balanced_low"] == pytest.approx(30.25)
-    assert baseline["balanced_upper"] == pytest.approx(38.75)
+    assert baseline["balanced_upper"] == pytest.approx(38.0)
 
 
 def test_history_baseline_needs_enough_nights():
     assert _baseline_from_history([30, 31, 32]) is None
+    assert _baseline_from_history(HISTORY[:27]) is None, "27 nights is below the floor"
     assert _baseline_from_history([]) is None
 
 
@@ -535,7 +543,7 @@ def test_history_baseline_rescues_the_underrated_night():
 def test_history_baseline_used_when_payload_has_none(breakdown):
     client = HistoryClient(hrv=cached_hrv(40))
     result = breakdown(client)
-    assert result["hrv_scoring_method"] == "personal_baseline_from_history"
+    assert result["hrv_scoring_method"] == "stored_history_approximate"
     assert result["components"]["hrv_score"] > 90.0
     assert client.history_calls == 1
 
@@ -553,7 +561,7 @@ def test_garmin_factor_still_beats_both(breakdown):
 
 
 def test_population_scale_when_history_is_too_short(breakdown):
-    result = breakdown(HistoryClient(history=[30, 31, 32], hrv=cached_hrv(40)))
+    result = breakdown(HistoryClient(history=HISTORY[:27], hrv=cached_hrv(40)))
     assert result["hrv_scoring_method"] == "population_scale_approximate"
 
 
@@ -598,6 +606,122 @@ def test_history_still_covers_days_written_before_the_ingestor_change(breakdown)
         readiness={"score": 62, "trainingReadiness": 62, "_partial": True},
     )
     result = breakdown(client)
-    assert result["hrv_scoring_method"] == "personal_baseline_from_history"
+    assert result["hrv_scoring_method"] == "stored_history_approximate"
     assert result["components"]["hrv_score"] > 90.0
     assert result["garmin_training_readiness"] == 62.0
+
+
+# --- Review findings ------------------------------------------------------
+
+
+def test_garmin_factor_survives_a_failing_hrv_call(breakdown):
+    """PR #4 review, High: the factor was applied inside the HRV call's try.
+
+    A raising get_hrv_data discarded a factor already in hand, and the
+    swallowing except turned that into a null component.
+    """
+
+    class NoHrv(StubClient):
+        def get_hrv_data(self, cdate, *a, **k):
+            raise RuntimeError("garmin said no")
+
+    result = breakdown(NoHrv(readiness=[{"score": 72, "hrvFactorPercent": 96}]))
+    assert result["components"]["hrv_score"] == 96.0
+    assert result["hrv_scoring_method"] == "garmin_hrv_factor"
+    assert result["components_missing"] == []
+    # The measurement itself is genuinely unavailable, and says so.
+    assert result["hrv_ms"] is None
+
+
+def test_failing_hrv_call_without_a_factor_is_still_missing(breakdown):
+    class NoHrv(StubClient):
+        def get_hrv_data(self, cdate, *a, **k):
+            raise RuntimeError("garmin said no")
+
+    result = breakdown(NoHrv())
+    assert result["components"]["hrv_score"] is None
+    assert result["components_missing"] == ["hrv_score"]
+
+
+def test_history_tier_reports_its_sample_count(breakdown):
+    """PR #4 review, Medium: an approximate tier should show its evidence."""
+    result = breakdown(HistoryClient(hrv=cached_hrv(40)))
+    assert result["hrv_scoring_method"] == "stored_history_approximate"
+    assert result["hrv_baseline_samples"] == len(HISTORY)
+
+
+def test_sample_count_absent_for_the_trusted_tiers(breakdown):
+    result = breakdown(HistoryClient(hrv=live_hrv(36)))
+    assert result["hrv_scoring_method"] == "personal_baseline"
+    assert result["hrv_baseline_samples"] is None
+
+
+def test_misordered_band_is_rejected():
+    """PR #4 review, Low: a bad band yielded a nonsense score rather than None."""
+    assert _extract_hrv_baseline(live_hrv(baseline={
+        "lowUpper": 60, "balancedLow": 36, "balancedUpper": 55,
+    })) is None
+
+
+def test_non_finite_band_is_rejected():
+    assert _extract_hrv_baseline(live_hrv(baseline={
+        "lowUpper": 32, "balancedLow": float("nan"), "balancedUpper": 55,
+    })) is None
+    assert _extract_hrv_baseline(live_hrv(baseline={
+        "lowUpper": 32, "balancedLow": 36, "balancedUpper": float("inf"),
+    })) is None
+
+
+def test_negative_band_is_rejected():
+    assert _extract_hrv_baseline(live_hrv(baseline={
+        "lowUpper": -5, "balancedLow": 36, "balancedUpper": 55,
+    })) is None
+
+
+def test_negative_descriptor_index_does_not_wrap():
+    """PR #4 review, Low: index -1 read the version column as a battery level."""
+    payload = real_body_battery(descriptor=False)
+    payload[0]["bodyBatteryValuesArray"] = [[1000, "MEASURED", 55, 1.0]]
+    payload[0]["bodyBatteryValueDescriptorDTOList"] = [
+        {"bodyBatteryValueDescriptorIndex": -1, "bodyBatteryValueDescriptorKey": "bodyBatteryLevel"},
+    ]
+    # Falls back to the positional default rather than reading row[-1] == 1.0.
+    assert _extract_body_battery_levels(payload) == [55.0]
+
+
+def test_boolean_descriptor_index_is_rejected():
+    payload = real_body_battery(descriptor=False)
+    payload[0]["bodyBatteryValuesArray"] = [[1000, "MEASURED", 55, 1.0]]
+    payload[0]["bodyBatteryValueDescriptorDTOList"] = [
+        {"bodyBatteryValueDescriptorIndex": True, "bodyBatteryValueDescriptorKey": "bodyBatteryLevel"},
+    ]
+    assert _extract_body_battery_levels(payload) == [55.0]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [{"score": 55, "hrvFactorPercent": 90}],
+        {"score": 55},
+        {"trainingReadiness": {"value": 55}},
+        {"score": 55, "trainingReadiness": 55, "_partial": True},
+    ],
+    ids=["live_list", "raw_dict", "nested_dict", "derived_scalar"],
+)
+def test_range_tools_read_every_readiness_shape(tools, payload):
+    """PR #4 review, Medium: three callers parsed only the nested dict.
+
+    The derived scalar was the worst of them — .get("value") on an int raised.
+    """
+
+    class Readiness(StubClient):
+        def get_activities_by_date(self, start, end, *a, **k):
+            return []
+
+        def get_training_readiness(self, cdate, *a, **k):
+            return payload
+
+    result = tools(
+        "get_period_summary", Readiness(), "daily", RANGE_START, True, True, True, True, True, True
+    )
+    assert result["aggregates"]["avg_training_readiness"] == 55.0
