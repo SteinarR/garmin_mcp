@@ -19,7 +19,7 @@ Design rules:
 import datetime
 import os
 
-from garmin_mcp.cache import PARTIAL_KEY, GarminCache, _as_date
+from garmin_mcp.cache import DISK_BACKED_HISTORY, PARTIAL_KEY, GarminCache, _as_date
 
 # Payloads stored verbatim by the ingestor; tools cannot distinguish these from
 # a live response.
@@ -85,6 +85,11 @@ class CachedGarminClient:
     @property
     def cache_stats(self):
         return dict(self._cache.stats)
+
+    # Declares what the method below actually does. Callers check this rather
+    # than the method's name, so nothing can be mistaken for a disk-backed
+    # history source by spelling alone.
+    hrv_history_source = DISK_BACKED_HISTORY
 
     def hrv_history(self, end_day, days=None):
         """Stored overnight HRV values, for callers building a personal baseline.

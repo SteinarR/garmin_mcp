@@ -6,6 +6,8 @@ import json
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from garmin_mcp.cache import DISK_BACKED_HISTORY
+
 # The garmin_client will be set by the main file
 garmin_client = None
 
@@ -364,13 +366,18 @@ def _baseline_from_history(values: List[float]) -> Optional[Dict[str, float]]:
 
 
 def _hrv_history_values(client: Any, day: Optional[datetime.date]) -> List[float]:
-    """Stored overnight HRV values, when the client exposes any.
+    """Stored overnight HRV values, when the client declares a disk-backed source.
 
-    `hrv_history` exists only on the cached client wrapper and reads disk only.
-    An uncached deployment has no attribute here and gets nothing, which is the
-    point: this must never turn into one Garmin call per day of window.
+    Gated on the client publishing DISK_BACKED_HISTORY, not on it merely having
+    a method of the right name. The distinction matters: this asks for a window
+    of days at once, so a source that turned out to hit the network would spend
+    most of a day's Garmin budget in one call. Anything that does not declare
+    itself gets nothing here and scoring falls through, exactly as it does on an
+    uncached deployment.
     """
     if day is None:
+        return []
+    if getattr(client, "hrv_history_source", None) is not DISK_BACKED_HISTORY:
         return []
     history = getattr(client, "hrv_history", None)
     if not callable(history):

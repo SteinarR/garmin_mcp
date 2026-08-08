@@ -12,6 +12,7 @@ import json
 import pytest
 
 from garmin_mcp import recommendations
+from garmin_mcp.cache import DISK_BACKED_HISTORY
 from garmin_mcp.recommendations import (
     _average_body_battery,
     _baseline_from_history,
@@ -501,7 +502,9 @@ HISTORY = [
 
 
 class HistoryClient(StubClient):
-    """A cached client: exposes hrv_history, which reads disk and never Garmin."""
+    """A cached client: declares a disk-backed history source and provides one."""
+
+    hrv_history_source = DISK_BACKED_HISTORY
 
     def __init__(self, history=None, **kwargs):
         super().__init__(**kwargs)
@@ -780,3 +783,46 @@ def test_scoring_curve_is_monotonic_and_bounded(baseline_kwargs):
     scores = [_score_hrv_against_baseline(v / 100, baseline) for v in range(10, 9000)]
     assert scores == sorted(scores)
     assert all(0.0 <= s <= 100.0 for s in scores)
+
+
+def test_history_ignored_when_the_source_is_not_declared(breakdown):
+    """The capability gate: having the method is not enough, it must declare itself.
+
+    This asks for a whole window of days at once, so a source that turned out
+    to hit the network would spend most of a day's Garmin budget in one call.
+    A forwarding proxy can satisfy a method name; it cannot satisfy an identity
+    check against a private sentinel.
+    """
+
+    class UndeclaredHistory(StubClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.history_calls = 0
+
+        def hrv_history(self, end_day, days=None):
+            self.history_calls += 1
+            return list(HISTORY)
+
+    client = UndeclaredHistory(hrv=cached_hrv(40))
+    result = breakdown(client)
+    assert result["hrv_scoring_method"] == "population_scale_approximate"
+    assert client.history_calls == 0, "an undeclared source must not even be called"
+
+
+def test_a_truthy_marker_is_not_enough(breakdown):
+    """A proxy answering every attribute truthily must still be refused."""
+
+    class TruthyProxy(StubClient):
+        hrv_history_source = True
+
+        def hrv_history(self, end_day, days=None):
+            raise AssertionError("must not be called")
+
+    result = breakdown(TruthyProxy(hrv=cached_hrv(40)))
+    assert result["hrv_scoring_method"] == "population_scale_approximate"
+
+
+def test_the_real_wrapper_declares_the_marker():
+    from garmin_mcp.cached_client import CachedGarminClient
+
+    assert CachedGarminClient.hrv_history_source is DISK_BACKED_HISTORY

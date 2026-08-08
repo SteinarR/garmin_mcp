@@ -37,6 +37,18 @@ SOURCE_VALUE = "garmin-ingestor-cache"
 # cache regardless of the configured floor.
 TRAINING_STATE_MIN_AGE_DAYS = 2
 
+# Identity marker for "this object's hrv_history reads stored files and issues
+# no Garmin request". Callers compare it with `is`, not for truthiness: a proxy
+# that answers every attribute with a truthy stub — a mock, a metrics wrapper, a
+# retry layer that forwards unknown calls onward — cannot accidentally satisfy
+# an identity check against a private object.
+#
+# Worth the ceremony because the failure is silent and expensive. Matching on
+# the method name alone would let a future forwarding wrapper turn one baseline
+# lookup into 60 live Garmin calls, against a budget of roughly 90-100 a day,
+# with nothing at the call site looking any different.
+DISK_BACKED_HISTORY = object()
+
 # Window used to build a personal HRV baseline from stored sleep payloads.
 # Roughly matches the span Garmin's own baseline covers, and each day costs one
 # large JSON parse, so results are memoised.

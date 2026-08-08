@@ -226,11 +226,17 @@ verbatim when present, so **cached dates now reach `garmin_hrv_factor` too**,
 with no live call. Days written before that change are not backfilled and still
 rely on the history tier, which is why both remain.
 
-`hrv_history` reads disk and never the live client, and exists only on the
-cached wrapper — an uncached deployment has no such attribute and falls through
-to the population scale. That is deliberate: fanning a baseline out into one
-Garmin call per day of window would exhaust the daily budget in a single tool
-call.
+`hrv_history` reads disk and never the live client. Scoring will only call it on
+a client that publishes `hrv_history_source = DISK_BACKED_HISTORY`, a private
+sentinel compared by identity — not on anything that merely has a method of that
+name. Anything undeclared falls through to the population scale, exactly as an
+uncached deployment does.
+
+The gate is worth the ceremony because this asks for a whole window of days at
+once. A source that turned out to hit the network would spend most of a day's
+budget in one tool call, and nothing at the call site would look different. A
+forwarding proxy or a mock can satisfy a method name; neither can satisfy an
+identity check against an object it cannot reach.
 
 **Treat `stored_history_approximate` as weaker than its neighbours.** The bands
 are percentiles of the user's own recent nights, so they carry two structural
