@@ -219,12 +219,37 @@ ingestor stores no HRV endpoint response for one to come from, so
 fixed scale rated a 40 ms night **40/100** where Garmin's own factor said
 **94**; percentile bands over the same user's 60-day history score it **91**.
 
-Since 2026-08-07 the ingestor also attaches `trainingReadinessRaw` — the
-untouched readiness response, `hrvFactorPercent` included — alongside the six
-normalised fields it already wrote. `cache.get_training_readiness` serves that
-verbatim when present, so **cached dates now reach `garmin_hrv_factor` too**,
-with no live call. Days written before that change are not backfilled and still
-rely on the history tier, which is why both remain.
+**The history tier reads low against Garmin, and now there is evidence.** The
+2026-08-08 deploy scored 2026-08-05 at **93.41** through the history bands.
+Garmin's own factor for that same night, recovered later the same day when the
+ingestor began storing it, is **100**.
+
+That is a 6.6 point gap on a single night, and the direction is what the review
+predicted. Percentile bands place a quarter of any period below "balanced" by
+construction, so a user whose HRV Garmin rates 92-100 almost every night —
+which this user's stored factors show — gets systematically marked down. Treat
+`stored_history_approximate` as a floor-filler for days with no factor, not as
+an estimate of what Garmin would say.
+
+Prefer `garmin_hrv_factor` wherever it is available, which since the ingestor
+change is most days.
+
+### Where the raw training-state blocks come from
+
+The ingestor attaches `trainingReadinessRaw` — the untouched readiness
+response, `hrvFactorPercent` included — alongside the six normalised fields it
+already writes. `cache.get_training_readiness` serves that verbatim when
+present, so **cached dates reach `garmin_hrv_factor` with no live call**.
+
+Live since 2026-08-08. Worth knowing how it arrived, because it is not what
+"applies to payloads written from now on" would suggest: the ingestor re-fetches
+a rolling window rather than only today, so its first run after deployment
+rewrote **eight** days at once, back to 2026-08-01. Six of those were already
+past the 2-day training-state freshness floor immediately, so the change was
+observable through the cache the same evening rather than two days later.
+
+Days older than that window keep the six-field record and are not backfilled,
+which is why the derived form and the history tier both remain.
 
 `hrv_history` reads disk and never the live client. Scoring will only call it on
 a client that publishes `hrv_history_source = DISK_BACKED_HISTORY`, a private
