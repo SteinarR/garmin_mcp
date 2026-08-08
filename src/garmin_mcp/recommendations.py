@@ -3,7 +3,10 @@ Training and Diet Recommendations functions for Garmin Connect MCP Server
 """
 import datetime
 import json
+import math
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+from garmin_mcp.cache import DISK_BACKED_HISTORY
 
 # The garmin_client will be set by the main file
 garmin_client = None
@@ -183,6 +186,277 @@ def _resolve_anchor_period(period: str, anchor_value: Optional[str]) -> Tuple[da
     # Anchor should reflect the clamped window end for consistency
     anchor_used = min(anchor, end)
     return start, end, anchor_used
+
+
+# Fewer nights than this and the percentile bands are noise, so scoring falls
+# through to the population scale rather than inventing a confident baseline.
+# At 14 the 10th percentile is decided almost entirely by the second and third
+# lowest readings, which is not a baseline so much as a rumour; 28 gives the
+# quartiles something to work with and matches the span Garmin's own baseline
+# covers.
+HRV_HISTORY_MIN_SAMPLES = 28
+
+
+def _first_number(*values: Any) -> Optional[float]:
+    """First value that is a real number. Unlike `a or b`, a legitimate 0 wins."""
+    for value in values:
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            return float(value)
+    return None
+
+
+def _body_battery_level_index(day: Dict[str, Any]) -> int:
+    """Column holding the battery level in each bodyBatteryValuesArray row.
+
+    Garmin ships a descriptor list naming the columns, so read the position
+    from it rather than trusting the usual
+    [timestamp, status, level, version] order.
+    """
+    descriptors = day.get("bodyBatteryValueDescriptorDTOList")
+    if isinstance(descriptors, list):
+        for descriptor in descriptors:
+            if not isinstance(descriptor, dict):
+                continue
+            key = descriptor.get("bodyBatteryValueDescriptorKey")
+            index = descriptor.get("bodyBatteryValueDescriptorIndex")
+            if key != "bodyBatteryLevel":
+                continue
+            if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+                break
+            return index
+    return 2
+
+
+def _extract_body_battery_levels(payload: Any) -> List[float]:
+    """Every body battery sample level in a get_body_battery payload.
+
+    The payload is a list of *day* objects, not samples: each carries its
+    readings in `bodyBatteryValuesArray`. Reading `bodyBatteryValue` off the
+    top-level rows — as this module did everywhere — matches nothing, so the
+    body battery component silently dropped out of every score that used it.
+    """
+    levels: List[float] = []
+    if not isinstance(payload, list):
+        return levels
+    for day in payload:
+        if not isinstance(day, dict):
+            continue
+        # A flat value on the day object is not a shape Garmin is known to
+        # return, but it costs nothing to honour if one ever appears.
+        flat = _first_number(day.get("bodyBatteryValue"))
+        if flat is not None:
+            levels.append(flat)
+        rows = day.get("bodyBatteryValuesArray")
+        if not isinstance(rows, list):
+            continue
+        index = _body_battery_level_index(day)
+        for row in rows:
+            # Reject a negative index rather than let it wrap: -1 would read the
+            # version column and report it as a battery level.
+            if isinstance(row, (list, tuple)) and 0 <= index < len(row):
+                value = _first_number(row[index])
+                if value is not None:
+                    levels.append(value)
+    return levels
+
+
+def _average_body_battery(payload: Any) -> Optional[float]:
+    """Mean body battery level for a payload, or None when it carries no samples."""
+    levels = _extract_body_battery_levels(payload)
+    if not levels:
+        return None
+    return sum(levels) / len(levels)
+
+
+def _extract_hrv_value(hrv: Any) -> Optional[float]:
+    """Overnight average HRV in ms, from either payload shape.
+
+    Live Garmin nests it at `hrvSummary.lastNightAvg`. The ingested-data cache
+    flattens it to `avgHrv`/`average` (cache.py). Reading only the flat keys
+    makes this resolve on cached dates and silently return None on live ones.
+    """
+    if not isinstance(hrv, dict):
+        return None
+    summary = hrv.get("hrvSummary")
+    if not isinstance(summary, dict):
+        summary = {}
+    return _first_number(
+        summary.get("lastNightAvg"),
+        hrv.get("lastNightAvg"),
+        hrv.get("avgHrv"),
+        hrv.get("average"),
+    )
+
+
+def _extract_hrv_baseline(hrv: Any) -> Optional[Dict[str, float]]:
+    """The user's personal HRV baseline bands, when live Garmin supplies them."""
+    if not isinstance(hrv, dict):
+        return None
+    summary = hrv.get("hrvSummary")
+    if not isinstance(summary, dict):
+        return None
+    baseline = summary.get("baseline")
+    if not isinstance(baseline, dict):
+        return None
+    low_upper = _first_number(baseline.get("lowUpper"))
+    balanced_low = _first_number(baseline.get("balancedLow"))
+    balanced_upper = _first_number(baseline.get("balancedUpper"))
+    if balanced_low is None or balanced_upper is None:
+        return None
+    if low_upper is None:
+        low_upper = balanced_low
+    return _validated_band(low_upper, balanced_low, balanced_upper)
+
+
+def _validated_band(
+    low_upper: float, balanced_low: float, balanced_upper: float
+) -> Optional[Dict[str, float]]:
+    """A band the scorer can use, or None.
+
+    The scoring segments assume a finite, correctly ordered band. A misordered
+    or non-finite one does not raise — it silently yields a nonsense score, or
+    NaN, which then averages into readiness looking like a real number.
+    """
+    values = (low_upper, balanced_low, balanced_upper)
+    if not all(math.isfinite(v) for v in values):
+        return None
+    if not 0 < low_upper <= balanced_low < balanced_upper:
+        return None
+    return {
+        "low_upper": low_upper,
+        "balanced_low": balanced_low,
+        "balanced_upper": balanced_upper,
+    }
+
+
+def _percentile(ordered: List[float], fraction: float) -> float:
+    """Linear-interpolated percentile of an already-sorted list."""
+    if len(ordered) == 1:
+        return ordered[0]
+    position = fraction * (len(ordered) - 1)
+    low = int(position)
+    high = min(low + 1, len(ordered) - 1)
+    return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
+
+
+def _baseline_from_history(values: List[float]) -> Optional[Dict[str, float]]:
+    """Personal HRV bands derived from the user's own recent nights.
+
+    Used when live Garmin supplied no baseline — which is every cached date,
+    since the ingestor stores no HRV endpoint response for one to come from.
+    The alternative there is a fixed millisecond scale, and that is what rated a
+    genuinely good night 20/100 in the first place: someone whose normal sits at
+    30-40 ms is not unhealthy, they just are not the population median.
+
+    The percentiles stand in for Garmin's own zones — the middle half of your
+    nights is 'balanced', the bottom tenth is 'low'.
+    """
+    if len(values) < HRV_HISTORY_MIN_SAMPLES:
+        return None
+    ordered = sorted(v for v in values if math.isfinite(v))
+    if len(ordered) < HRV_HISTORY_MIN_SAMPLES:
+        return None
+    return _validated_band(
+        _percentile(ordered, 0.10),
+        _percentile(ordered, 0.25),
+        _percentile(ordered, 0.75),
+    )
+
+
+def _hrv_history_values(client: Any, day: Optional[datetime.date]) -> List[float]:
+    """Stored overnight HRV values, when the client declares a disk-backed source.
+
+    Gated on the client publishing DISK_BACKED_HISTORY, not on it merely having
+    a method of the right name. The distinction matters: this asks for a window
+    of days at once, so a source that turned out to hit the network would spend
+    most of a day's Garmin budget in one call. Anything that does not declare
+    itself gets nothing here and scoring falls through, exactly as it does on an
+    uncached deployment.
+    """
+    if day is None:
+        return []
+    if getattr(client, "hrv_history_source", None) is not DISK_BACKED_HISTORY:
+        return []
+    history = getattr(client, "hrv_history", None)
+    if not callable(history):
+        return []
+    try:
+        values = history(day)
+    except Exception:
+        return []
+    if not isinstance(values, list):
+        return []
+    return [v for v in values if not isinstance(v, bool) and isinstance(v, (int, float))]
+
+
+def _score_hrv_against_baseline(value: float, baseline: Dict[str, float]) -> float:
+    """Score overnight HRV against the user's own balanced band, not a fixed scale.
+
+    HRV is strongly individual, so absolute millisecond thresholds misjudge
+    people whose normal sits outside them. Garmin publishes a per-user baseline;
+    these segments map onto its own zones — balanced spans 60-90, at or above the
+    top of balanced earns 90-100, and the low zone falls away below 40.
+    """
+    low_upper = baseline["low_upper"]
+    balanced_low = baseline["balanced_low"]
+    balanced_upper = baseline["balanced_upper"]
+
+    if value >= balanced_upper:
+        # Room above the band, but flatten it: more HRV is not linearly better.
+        headroom = max(balanced_upper * 0.25, 1.0)
+        over = min((value - balanced_upper) / headroom, 1.0)
+        return round(90.0 + 10.0 * over, 2)
+    if value >= balanced_low:
+        span = balanced_upper - balanced_low
+        return round(60.0 + 30.0 * (value - balanced_low) / span, 2)
+
+    # Below the balanced band. Keep the floor under balanced_low even for a
+    # band whose numbers are small, or the ramp below inverts.
+    floor = min(max(low_upper * 0.6, 1.0), balanced_low * 0.9)
+    if value <= floor:
+        return 0.0
+    if balanced_low > low_upper:
+        # Garmin gave a distinct low zone: floor->low_upper covers 0-40, and
+        # low_upper->balanced_low covers 40-60.
+        if value >= low_upper:
+            return round(40.0 + 20.0 * (value - low_upper) / (balanced_low - low_upper), 2)
+        return round(40.0 * (value - floor) / (low_upper - floor), 2)
+    # No distinct low zone — Garmin omitted `lowUpper`, so it was substituted
+    # with balanced_low. Ramp straight to 60 across the whole sub-balanced
+    # region. Stopping at 40 here would jump 20 points at balanced_low, which
+    # is a fifth of the HRV component decided by a rounding difference.
+    return round(60.0 * (value - floor) / (balanced_low - floor), 2)
+
+
+def _garmin_hrv_factor(readiness: Any) -> Optional[float]:
+    """Garmin's own HRV factor (0-100) out of a training readiness payload.
+
+    Live Garmin returns a single-element list; the cache returns a bare dict
+    carrying only the readiness scalar, so this is absent there.
+    """
+    if isinstance(readiness, list):
+        readiness = readiness[0] if readiness else None
+    if not isinstance(readiness, dict):
+        return None
+    return _first_number(readiness.get("hrvFactorPercent"))
+
+
+def _garmin_readiness_score(readiness: Any) -> Optional[float]:
+    """Garmin's own training readiness score (0-100), across both payload shapes."""
+    if isinstance(readiness, list):
+        readiness = readiness[0] if readiness else None
+    if not isinstance(readiness, dict):
+        return None
+    nested = readiness.get("trainingReadiness")
+    if isinstance(nested, dict):
+        value = _first_number(nested.get("value"), nested.get("score"))
+        if value is not None:
+            return value
+    # A bare `trainingReadiness` scalar is what the cache stores; a dict here
+    # already failed above and is ignored by _first_number.
+    return _first_number(readiness.get("score"), nested)
 
 
 def register_tools(app):
@@ -437,13 +711,11 @@ def register_tools(app):
             # Analyze body battery trends
             body_battery_values = []
             for day in daily_summary:
-                battery = day.get("body_battery")
-                if battery and isinstance(battery, dict):
-                    # Extract body battery values
-                    if isinstance(battery, list) and len(battery) > 0:
-                        for entry in battery:
-                            if isinstance(entry, dict) and "bodyBatteryValue" in entry:
-                                body_battery_values.append(entry.get("bodyBatteryValue", 0))
+                # Guarded on isinstance(dict) before, which made the list
+                # handling below unreachable; the payload is always a list.
+                body_battery_values.extend(
+                    _extract_body_battery_levels(day.get("body_battery"))
+                )
             
             if body_battery_values:
                 avg_body_battery = sum(body_battery_values) / len(body_battery_values)
@@ -452,10 +724,13 @@ def register_tools(app):
             # Analyze training readiness
             readiness_scores = []
             for day in daily_summary:
-                readiness = day.get("training_readiness")
-                if readiness and isinstance(readiness, dict):
-                    if "trainingReadiness" in readiness:
-                        readiness_scores.append(readiness.get("trainingReadiness", {}).get("value", 0))
+                # Handles every shape the cache and the live client produce: a
+                # list, a raw dict with top-level `score`, the nested dict, and
+                # the derived scalar. Reading .get("value") off that last one
+                # raised, since the scalar is an int.
+                score = _garmin_readiness_score(day.get("training_readiness"))
+                if score is not None:
+                    readiness_scores.append(score)
             
             if readiness_scores:
                 avg_readiness = sum(readiness_scores) / len(readiness_scores)
@@ -722,12 +997,7 @@ def register_tools(app):
                         bb = garmin_client.get_body_battery(d, d)
                         day["body_battery"] = bb if bb else None
                         # Aggregate best-effort
-                        if isinstance(bb, list):
-                            for entry in bb:
-                                if isinstance(entry, dict):
-                                    val = entry.get("bodyBatteryValue")
-                                    if isinstance(val, (int, float)):
-                                        body_battery_values.append(float(val))
+                        body_battery_values.extend(_extract_body_battery_levels(bb))
                     except Exception:
                         day["body_battery"] = None
 
@@ -736,11 +1006,9 @@ def register_tools(app):
                     try:
                         tr = garmin_client.get_training_readiness(d)
                         day["training_readiness"] = tr if tr else None
-                        if isinstance(tr, dict):
-                            if "trainingReadiness" in tr and isinstance(tr["trainingReadiness"], dict):
-                                val = tr["trainingReadiness"].get("value")
-                                if isinstance(val, (int, float)):
-                                    readiness_values.append(float(val))
+                        score = _garmin_readiness_score(tr)
+                        if score is not None:
+                            readiness_values.append(score)
                     except Exception:
                         day["training_readiness"] = None
 
@@ -749,10 +1017,9 @@ def register_tools(app):
                     try:
                         hrv = garmin_client.get_hrv_data(d)
                         day["hrv"] = hrv if hrv else None
-                        if isinstance(hrv, dict):
-                            val = hrv.get("avgHrv") or hrv.get("average")
-                            if isinstance(val, (int, float)):
-                                hrv_values.append(float(val))
+                        val = _extract_hrv_value(hrv)
+                        if val is not None:
+                            hrv_values.append(val)
                     except Exception:
                         day["hrv"] = None
 
@@ -852,8 +1119,7 @@ def register_tools(app):
                 if "hrv" in include:
                     try:
                         hrv = garmin_client.get_hrv_data(d)
-                        if isinstance(hrv, dict):
-                            entry["hrv"] = hrv.get("avgHrv") or hrv.get("average")
+                        entry["hrv"] = _extract_hrv_value(hrv)
                     except Exception:
                         entry["hrv"] = None
                 # Sleep (hours)
@@ -883,17 +1149,10 @@ def register_tools(app):
                 if "body_battery" in include:
                     try:
                         bb = garmin_client.get_body_battery(d, d)
-                        avg_bb = None
-                        if isinstance(bb, list) and bb:
-                            vals = []
-                            for row in bb:
-                                if isinstance(row, dict):
-                                    val = row.get("bodyBatteryValue")
-                                    if isinstance(val, (int, float)):
-                                        vals.append(float(val))
-                            if vals:
-                                avg_bb = round(sum(vals)/len(vals), 2)
-                        entry["body_battery_avg"] = avg_bb
+                        avg_bb = _average_body_battery(bb)
+                        entry["body_battery_avg"] = (
+                            round(avg_bb, 2) if avg_bb is not None else None
+                        )
                     except Exception:
                         entry["body_battery_avg"] = None
                 # Weight (from body composition single day)
@@ -996,7 +1255,7 @@ def register_tools(app):
                     rec["rhr"] = None
                 try:
                     hrv = garmin_client.get_hrv_data(d)
-                    rec["hrv"] = hrv.get("avgHrv") or hrv.get("average") if isinstance(hrv, dict) else None
+                    rec["hrv"] = _extract_hrv_value(hrv)
                 except Exception:
                     rec["hrv"] = None
                 try:
@@ -1059,12 +1318,18 @@ def register_tools(app):
     @app.tool()
     async def get_readiness_breakdown(date: str) -> str:
         """Provide a simple readiness breakdown (0-100) from available components for a given date.
-        
+
         Components:
           - sleep_hours target 8h (0-100)
           - body_battery avg (0-100)
-          - HRV scaled (heuristic: 0-100 by mapping 20-100 ms)
+          - HRV, scored against the user's own Garmin baseline when available
           - stress inverse (if present) 0-100
+
+        Garmin's own training readiness score is reported alongside the composite
+        under `garmin_training_readiness`. Prefer it where it is present: it is
+        Garmin's model rather than this equal-weighted heuristic. `components_used`
+        names the components that actually resolved, since a missing one is
+        dropped from the average rather than counted as zero.
         """
         try:
             resolved_date = _parse_single_date(date)
@@ -1095,26 +1360,60 @@ def register_tools(app):
             bb_score = None
             try:
                 bb = garmin_client.get_body_battery(date_str, date_str)
-                if isinstance(bb, list) and bb:
-                    vals = [float(row.get("bodyBatteryValue")) for row in bb if isinstance(row, dict) and isinstance(row.get("bodyBatteryValue"), (int, float))]
-                    if vals:
-                        bb_score = sum(vals)/len(vals)
+                bb_score = _average_body_battery(bb)
             except Exception:
                 pass
 
-            # HRV heuristic scale 20-100 ms -> 0-100
-            hrv_score = None
+            # Garmin's own readiness model, used for the HRV factor below and
+            # reported alongside the composite for comparison.
+            garmin_readiness = None
+            garmin_hrv_factor = None
             try:
-                hrv = garmin_client.get_hrv_data(date_str)
-                val = None
-                if isinstance(hrv, dict):
-                    val = hrv.get("avgHrv") or hrv.get("average")
-                if isinstance(val, (int, float)):
-                    v = float(val)
-                    # Map 20ms -> 0, 100ms -> 100
-                    hrv_score = max(0.0, min(100.0, (v - 20.0) / (100.0 - 20.0) * 100.0))
+                readiness_payload = garmin_client.get_training_readiness(date_str)
+                garmin_readiness = _garmin_readiness_score(readiness_payload)
+                garmin_hrv_factor = _garmin_hrv_factor(readiness_payload)
             except Exception:
                 pass
+
+            # Fetch HRV for the reported measurement and for the lower-priority
+            # scoring paths. Kept in its own try: scoring below must not depend
+            # on this succeeding, or a failure here would discard a Garmin
+            # factor already in hand.
+            hrv = None
+            try:
+                hrv = garmin_client.get_hrv_data(date_str)
+            except Exception:
+                pass
+            hrv_value = _extract_hrv_value(hrv)
+            baseline = _extract_hrv_baseline(hrv)
+
+            # Score in descending order of trustworthiness.
+            hrv_score = None
+            hrv_method = None
+            hrv_baseline_samples = None
+            if garmin_hrv_factor is not None:
+                hrv_score = max(0.0, min(100.0, garmin_hrv_factor))
+                hrv_method = "garmin_hrv_factor"
+            elif hrv_value is not None and baseline is not None:
+                hrv_score = _score_hrv_against_baseline(hrv_value, baseline)
+                hrv_method = "personal_baseline"
+            elif hrv_value is not None:
+                history = _hrv_history_values(garmin_client, resolved_date)
+                history_baseline = _baseline_from_history(history)
+                if history_baseline is not None:
+                    hrv_baseline_samples = len(history)
+                    hrv_score = _score_hrv_against_baseline(hrv_value, history_baseline)
+                    # Named approximate on purpose: the bands are percentiles of
+                    # this user's own recent nights, so a sustained decline drags
+                    # the baseline down with it and poor readings start to look
+                    # normal. Prefer garmin_hrv_factor wherever it is available.
+                    hrv_method = "stored_history_approximate"
+                else:
+                    # Nothing personal to compare against. A coarse population
+                    # scale, and it will misjudge anyone whose normal sits
+                    # outside it.
+                    hrv_score = max(0.0, min(100.0, (hrv_value - 20.0) / (70.0 - 20.0) * 100.0))
+                    hrv_method = "population_scale_approximate"
 
             # Stress inverse (if daily value present)
             stress_score = None
@@ -1129,20 +1428,30 @@ def register_tools(app):
             except Exception:
                 pass
 
-            # Combine available components equally
-            comps = [s for s in [sleep_score, bb_score, hrv_score, stress_score] if isinstance(s, (int, float))]
-            readiness = round(sum(comps)/len(comps), 2) if comps else None
+            # Combine available components equally. A component that did not
+            # resolve is dropped rather than zeroed, so name the survivors: the
+            # composite is otherwise indistinguishable from a full four-way one.
+            named = {
+                "sleep_score": sleep_score,
+                "body_battery_score": bb_score,
+                "hrv_score": hrv_score,
+                "stress_inverse_score": stress_score,
+            }
+            used = [name for name, score in named.items() if isinstance(score, (int, float))]
+            missing = [name for name in named if name not in used]
+            readiness = round(sum(named[name] for name in used)/len(used), 2) if used else None
 
             return _to_json_str({
                 "date": date_str,
                 "input": date,
-                "components": {
-                    "sleep_score": sleep_score,
-                    "body_battery_score": bb_score,
-                    "hrv_score": hrv_score,
-                    "stress_inverse_score": stress_score
-                },
-                "readiness_score": readiness
+                "components": named,
+                "components_used": used,
+                "components_missing": missing,
+                "hrv_ms": hrv_value,
+                "hrv_scoring_method": hrv_method,
+                "hrv_baseline_samples": hrv_baseline_samples,
+                "readiness_score": readiness,
+                "garmin_training_readiness": garmin_readiness,
             })
         except Exception as e:
             return f"Error computing readiness breakdown: {str(e)}"
@@ -1179,8 +1488,7 @@ def register_tools(app):
                 # HRV
                 try:
                     hrv = garmin_client.get_hrv_data(d)
-                    hv = hrv.get("avgHrv") or hrv.get("average") if isinstance(hrv, dict) else None
-                    have["hrv"] = isinstance(hv, (int, float))
+                    have["hrv"] = _extract_hrv_value(hrv) is not None
                 except Exception:
                     have["hrv"] = False
                 # Body battery
@@ -1289,19 +1597,17 @@ def register_tools(app):
                 # body battery
                 try:
                     bb = garmin_client.get_body_battery(d, d)
-                    if isinstance(bb, list):
-                        vals = [float(row.get("bodyBatteryValue")) for row in bb if isinstance(row, dict) and isinstance(row.get("bodyBatteryValue"), (int, float))]
-                        if vals:
-                            bb_values.append(sum(vals)/len(vals))
+                    avg_bb = _average_body_battery(bb)
+                    if avg_bb is not None:
+                        bb_values.append(avg_bb)
                 except Exception:
                     pass
                 # readiness
                 try:
                     tr = garmin_client.get_training_readiness(d)
-                    if isinstance(tr, dict) and "trainingReadiness" in tr and isinstance(tr["trainingReadiness"], dict):
-                        val = tr["trainingReadiness"].get("value")
-                        if isinstance(val, (int, float)):
-                            readiness_scores.append(float(val))
+                    score = _garmin_readiness_score(tr)
+                    if score is not None:
+                        readiness_scores.append(score)
                 except Exception:
                     pass
                 # steps

@@ -115,7 +115,7 @@ a wrong number without erroring.
 - `get_period_summary(period: str, anchor_date: Optional[str] = None, include_activities: bool = True, include_sleep: bool = True, include_stress: bool = True, include_body_battery: bool = True, include_training_readiness: bool = True, include_hrv: bool = False, include_stats: bool = True, activity_type: str = "")` - Single-pane summary for daily/weekly/monthly with aggregates and per-day details (accepts anchor phrases like "last week", "this month")
 - `get_trends(start_date: str, end_date: str, include: Optional[List[str]] = None)` - Trends with 7/28-day rolling averages and start→end deltas for selected metrics (start/end may be relative phrases such as "last 28 days")
 - `detect_anomalies(start_date: str, end_date: str, rhr_bpm_increase: int = 5, hrv_ms_drop: int = 15, sleep_hours_min: float = 6.0, steps_drop_pct: float = 30.0)` - Heuristic anomaly detection for recovery red flags (range accepts relative phrases)
-- `get_readiness_breakdown(date: str)` - Component scores (sleep, body battery, HRV, stress inverse) and combined readiness score (0–100) for a date or relative phrase (e.g., "today", "last week")
+- `get_readiness_breakdown(date: str)` - Component scores (sleep, body battery, HRV, stress inverse), which components resolved, and a combined readiness score (0–100) for a date or relative phrase (e.g., "today", "last week"). Reports Garmin's own training readiness alongside the composite
 - `get_data_completeness(start_date: str, end_date: str)` - Per-day completeness and overall score across key signals (sleep, steps, HR, HRV, body battery) with support for relative ranges
 - `get_hydration_guidance(weight_kg: float, training_minutes: int = 0, temperature_c: Optional[float] = None)` - Daily hydration target (ml) with baseline, training increment, and heat multiplier
 - `get_coach_cues(period: str, anchor_date: Optional[str] = None)` - Concise coach guidance for daily/weekly/monthly periods using high-signal metrics
@@ -142,18 +142,20 @@ them without new information** — the failures are upstream of this repo.
 is Garmin declining the request for this account rather than a bug in the call —
 no amount of parameter fiddling changes it.
 
-### `get_hrv_data` — needs re-verification, not debugging
+### `get_hrv_data` — CLOSED, was never broken after `6273370`
+
+Kept as a record because this note sat open for a while and should not be
+reopened from the original report.
 
 Reported as an intermittent Pydantic validation error (`Input should be a valid
-string`, receiving a dict), succeeding on retry. That symptom is exactly what
-`_to_json_str` fixed in `6273370` (2026-07-29), which is an ancestor of every
-currently deployed ref — so either the observation predates the deploy, or the
-cause is something else.
+string`, receiving a dict) that succeeded on retry — MCP validating the tool's
+`-> str` return signature against a raw dict. `training.py:114-126` returns
+`_to_json_str(hrv_data)` on the success path and f-strings on the empty and
+error paths, so every branch returns a `str`. That call was introduced by
+`6273370` (2026-07-29), so the failure has been impossible since.
 
-Left in place because it has not been re-tested since. It is also not on the
-critical path: HRV arrives inside `get_sleep_data`, which is where the sleep
-analyst reads it. If someone does re-test, record the result here and delete
-this note either way.
+Confirmed live twice against the deployed build, 2026-08-07: clean JSON string,
+no validation error. Do not spend time on it again without a *new* report.
 
 ### `get_sleep_data` — succeeds, but the result cannot be consumed
 
@@ -185,45 +187,151 @@ the tool. Anything that must go through MCP needs either a summary tool that
 returns Garmin's own `dailySleepDTO` scores and qualifiers, or an opt-in flag
 that drops the epoch series.
 
-### `get_readiness_breakdown` — returns a confident wrong number
+### `get_readiness_breakdown` — fixed, but still a heuristic
 
-Two defects, both still present, and neither raises an error — which is what
-makes them worse than the broken list above.
+Both defects recorded here are fixed. Covered by `tests/test_readiness.py`,
+which runs offline.
 
-**The HRV component is dead on live data.** Five call sites read
-`hrv.get("avgHrv") or hrv.get("average")` — `recommendations.py` lines 753,
-856, 999, 1111 and 1182 — but live `get_hrv_data` nests the value at
-`hrvSummary.lastNightAvg`. It resolves to `None`, so readiness silently becomes
-a three-component average instead of four. It only populates when served from
-cache, because `cache.py:201` happens to flatten it to `avgHrv` — so the bug
-disappears exactly when you test against settled dates and reappears on today.
+**The HRV component was dead on live data.** The tool read
+`hrv.get("avgHrv") or hrv.get("average")`, but live `get_hrv_data` nests the
+value at `hrvSummary.lastNightAvg`. It resolved to `None`, so readiness silently
+became a three-component average instead of four — and it only populated when
+served from cache, because `cache.py:201` flattens HRV to `avgHrv`. The bug
+therefore disappeared exactly when tested against settled dates and reappeared
+on today. `_extract_hrv_value` now reads both shapes, preferring the live one.
 
-**The scale is miscalibrated when it does work.** `recommendations.py:1114`
-maps 20 ms → 0 and 100 ms → 100. An overnight HRV of 36 ms scores **20/100**,
-while Garmin's own baseline calls the same night `BALANCED` and rates the HRV
-factor 96 `GOOD`. A good night is scored as near-total failure and drags the
-composite down with it.
+**The scale was miscalibrated when it did work.** The old map ran 20 ms → 0 and
+100 ms → 100, so a 36 ms night scored **20/100** while Garmin's own baseline
+called it `BALANCED` and rated the HRV factor 96 `GOOD`. HRV is too individual
+for fixed millisecond thresholds. Scoring now runs in descending order of
+trustworthiness, reported per call in `hrv_scoring_method`:
 
-`get_training_readiness` already returns the shape this tool is trying to
-compute — score, `sleepScore`, `sleepHistoryFactorPercent` — in about 1 KB.
-That is the thing to copy, rather than deriving readiness from raw hours.
+| Method | Source | When |
+|---|---|---|
+| `garmin_hrv_factor` | `hrvFactorPercent` from `get_training_readiness` | Live, and Garmin supplies the factor |
+| `personal_baseline` | `hrvSummary.baseline` — the user's own balanced band | Live, no factor available |
+| `stored_history_approximate` | Percentile bands over stored overnight HRV | Cached dates, ≥28 nights on disk |
+| `population_scale_approximate` | Fixed 20-70 ms map | Last resort: no cache, or too little history |
+
+The history tier exists because cached dates carry no HRV baseline — the
+ingestor stores no HRV endpoint response for one to come from, so
+`cache.get_hrv_data` synthesises its result from raw sleep. Verified live, the
+fixed scale rated a 40 ms night **40/100** where Garmin's own factor said
+**94**; percentile bands over the same user's 60-day history score it **91**.
+
+Since 2026-08-07 the ingestor also attaches `trainingReadinessRaw` — the
+untouched readiness response, `hrvFactorPercent` included — alongside the six
+normalised fields it already wrote. `cache.get_training_readiness` serves that
+verbatim when present, so **cached dates now reach `garmin_hrv_factor` too**,
+with no live call. Days written before that change are not backfilled and still
+rely on the history tier, which is why both remain.
+
+`hrv_history` reads disk and never the live client. Scoring will only call it on
+a client that publishes `hrv_history_source = DISK_BACKED_HISTORY`, a private
+sentinel compared by identity — not on anything that merely has a method of that
+name. Anything undeclared falls through to the population scale, exactly as an
+uncached deployment does.
+
+The gate is worth the ceremony because this asks for a whole window of days at
+once. A source that turned out to hit the network would spend most of a day's
+budget in one tool call, and nothing at the call site would look different. A
+forwarding proxy or a mock can satisfy a method name; neither can satisfy an
+identity check against an object it cannot reach.
+
+**Treat `stored_history_approximate` as weaker than its neighbours.** The bands
+are percentiles of the user's own recent nights, so they carry two structural
+flaws: defining the middle 50% as "balanced" guarantees a quarter of an
+otherwise stable period reads below balanced, and a sustained decline drags the
+baseline down with it until poor readings look normal. It exists because the
+alternative on cached dates is a fixed millisecond scale that is worse. The
+sample count behind any given score is reported as `hrv_baseline_samples`;
+below 28 nights the tier declines to score at all and hands off to the
+population scale.
+
+On the recorded 36 ms night that scored 20: it now scores 96 via Garmin's own
+factor, or 60 against the personal baseline when the factor is absent.
+
+**A dropped component is now named, not hidden.** `components_used` and
+`components_missing` say which components entered the average, so a three-way
+composite is no longer indistinguishable from a four-way one. Garmin's own score
+is reported alongside as `garmin_training_readiness` — prefer it where present,
+since it is Garmin's model rather than this equal-weighted heuristic.
+
+**The same defect at four other call sites is also fixed.** All of them now go
+through `_extract_hrv_value`:
+
+| Tool | Was |
+|---|---|
+| `get_trends` | `hrv` `None` for every day in the series |
+| `detect_anomalies` | `hrv_depressed` could never fire — a real 30 ms drop went unflagged |
+| `get_data_completeness` | HRV always scored absent, deflating the completeness score |
+| `get_period_summary` | `avg_hrv` omitted from aggregates entirely |
+
+Note that an earlier revision of this file named `get_optimized_health_data` and
+`get_coach_cues` among the affected tools. That was wrong:
+`get_optimized_health_data` stores the HRV payload verbatim and never extracts a
+scalar, and `get_coach_cues` does not read HRV at all. The four above are the
+real set.
+
+### Body battery — the same defect, found in production
+
+Fixed. Five call sites read `bodyBatteryValue` off each top-level row of a
+`get_body_battery` payload. That is not the shape Garmin returns: the payload is
+a list of **day** objects, each holding its readings in `bodyBatteryValuesArray`
+as `[timestamp, status, level, version]` rows. The lookup matched nothing, so
+body battery silently dropped out of `get_readiness_breakdown`,
+`get_period_summary`, `get_trends`, `get_coach_cues` and
+`get_training_and_diet_recommendations`.
+
+All five now use `_extract_body_battery_levels`, which locates the level column
+via Garmin's own `bodyBatteryValueDescriptorDTOList` rather than trusting the
+position, falling back to index 2.
+
+Two things about how this was found are worth keeping:
+
+- **`components_missing` surfaced it.** A settled date returned
+  `body_battery_score: null` with a perfectly good cached payload on disk. The
+  old output could not have shown this — a dropped component was
+  indistinguishable from one that scored.
+- **The unit tests hid it.** The stub in `tests/test_readiness.py` was written
+  to match what the code *read* rather than what Garmin *returns*, so every
+  body-battery assertion passed against a payload shape that does not exist.
+  `tests/test_cache.py` had the correct shape the whole time. When writing a
+  fixture, copy the real payload; never infer it from the consuming code.
 
 ### Confirmed stable
 
 Depend on these freely:
 
-- `get_sleep_data` (single date)
 - `get_optimized_health_data` (date ranges)
 - `get_activities_by_date` / `get_activities_fordate`
 - `get_activity_splits`
 - `get_activity_hr_in_timezones`
 - `get_weigh_ins`
 
-### Long sessions
+`get_sleep_data` used to be listed here as well, which contradicted its own
+entry above. Both halves were true in different senses — the Garmin call is
+reliable, the MCP round-trip blows the result limit — but "depend on it freely"
+is the wrong advice for a tool that errors every time it is called through MCP.
+It is reliable as a *data source on disk*, which is how the sleep analyst uses
+it; it is not usable as an MCP tool until the payload is trimmed.
 
-Many sequential calls in one session hit rate limiting or drop the MCP
-connection outright. For any backfill, prefer monthly chunks via
-`get_optimized_health_data` over per-day calls, and keep the call count per
-session modest. See the cache notes in [README.md](README.md#ingested-data-cache)
-for how much of this the ingested-data cache absorbs.
+### Long sessions and the API budget
+
+**Garmin allows roughly 90-100 API calls per day for the whole account. Make
+only the calls you need.** Many sequential calls in one session hit rate
+limiting or drop the MCP connection outright.
+
+- Never use a range tool to fetch a single day — the per-day loops cost 5-7
+  calls for every day in the range.
+- For any backfill, prefer monthly chunks via `get_optimized_health_data` over
+  per-day calls.
+- Pass explicit include-lists to `get_trends` and `get_period_summary`; each
+  extra metric is another call per day of range.
+- Settled dates may be served from cache at no API cost; today and yesterday
+  never are.
+
+See [README.md](README.md#api-budget) for the full rules and
+[the cache notes](README.md#ingested-data-cache) for how much of this the
+ingested-data cache absorbs.
 

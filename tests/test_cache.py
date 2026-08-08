@@ -7,11 +7,12 @@ recording stub, and the ingestor layout is built in a tmp_path fixture.
 
 import datetime
 import json
+import os
 import sqlite3
 
 import pytest
 
-from garmin_mcp.cache import GarminCache
+from garmin_mcp.cache import GarminCache, _is_readonly_directory_error
 from garmin_mcp.cached_client import CachedGarminClient, build_cached_client
 
 
@@ -443,3 +444,271 @@ def test_build_degrades_when_dir_missing(monkeypatch, tmp_path):
     monkeypatch.setenv("GARMIN_CACHE_DIR", str(tmp_path / "nope"))
     live = FakeClient()
     assert build_cached_client(live) is live
+
+
+# -- read-only mount warning ---------------------------------------------
+#
+# The trap this guards against: a read-only context-DB mount works for as long
+# as some other connection keeps -wal/-shm alive on disk, then starts failing
+# silently once they are gone. See _is_readonly_directory_error in cache.py.
+
+
+def test_readonly_directory_error_is_recognised():
+    exc = sqlite3.OperationalError("attempt to write a readonly database")
+    assert _is_readonly_directory_error(exc)
+
+
+def test_other_sqlite_errors_are_not_mistaken_for_it():
+    assert not _is_readonly_directory_error(sqlite3.OperationalError("no such table: x"))
+    assert not _is_readonly_directory_error(sqlite3.DatabaseError("file is not a database"))
+
+
+def test_warning_fires_once_not_per_query(data_dir, db_path):
+    seen = []
+    cache = GarminCache(
+        data_dir=data_dir, db_path=db_path, min_age_days=1, on_warning=seen.append
+    )
+
+    def explode(*a, **k):
+        raise sqlite3.OperationalError("attempt to write a readonly database")
+
+    original = sqlite3.connect
+    sqlite3.connect = explode
+    try:
+        for _ in range(3):
+            assert cache._query("SELECT 1") == []
+    finally:
+        sqlite3.connect = original
+
+    assert len(seen) == 1
+    assert "read-only" in seen[0]
+    assert str(db_path) in seen[0]
+    assert cache.stats["error"] == 3
+
+
+def test_unrecognised_sqlite_error_warns_separately(data_dir, db_path):
+    seen = []
+    cache = GarminCache(
+        data_dir=data_dir, db_path=db_path, min_age_days=1, on_warning=seen.append
+    )
+    original = sqlite3.connect
+    sqlite3.connect = lambda *a, **k: (_ for _ in ()).throw(sqlite3.OperationalError("no such table: x"))
+    try:
+        assert cache._query("SELECT 1") == []
+    finally:
+        sqlite3.connect = original
+    assert len(seen) == 1
+    assert "no such table" in seen[0]
+    assert "read-only" not in seen[0]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_readonly_directory_reproduced_end_to_end(tmp_path, data_dir):
+    """The real thing: a WAL database whose -shm cannot be recreated."""
+    db_dir = tmp_path / "context"
+    db_dir.mkdir()
+    real_db = db_dir / "context_kernel.db"
+    conn = sqlite3.connect(real_db)
+    conn.execute("PRAGMA journal_mode=wal")
+    conn.execute("CREATE TABLE activity_records (garmin_activity_id TEXT)")
+    conn.commit()
+    conn.close()
+    # Drop the sidecars the way SQLite does when the last connection closes,
+    # then take away the directory's write bit.
+    for suffix in ("-wal", "-shm"):
+        sidecar = real_db.with_name(real_db.name + suffix)
+        if sidecar.exists():
+            sidecar.unlink()
+    db_dir.chmod(0o555)
+    seen = []
+    try:
+        cache = GarminCache(
+            data_dir=data_dir, db_path=real_db, min_age_days=1, on_warning=seen.append
+        )
+        assert cache._query("SELECT 1 FROM activity_records") == []
+    finally:
+        db_dir.chmod(0o755)
+    assert seen and "read-only" in seen[0]
+
+
+# -- HRV history for personal baselines -----------------------------------
+
+
+def test_hrv_history_reads_stored_sleep_only(data_dir, db_path):
+    cache = GarminCache(data_dir=data_dir, db_path=db_path, min_age_days=1)
+    values = cache.hrv_history(TODAY, days=30)
+    # The fixture writes one settled day, carrying avgOvernightHrv 62.
+    assert values == [62.0]
+
+
+def test_hrv_history_excludes_the_day_being_scored(data_dir, db_path):
+    cache = GarminCache(data_dir=data_dir, db_path=db_path, min_age_days=1)
+    # SETTLED itself must not appear in its own baseline.
+    assert cache.hrv_history(SETTLED, days=30) == []
+    assert cache.hrv_history(SETTLED + datetime.timedelta(days=1), days=30) == [62.0]
+
+
+def test_hrv_history_memoises_repeat_windows(data_dir, db_path, monkeypatch):
+    cache = GarminCache(data_dir=data_dir, db_path=db_path, min_age_days=1)
+    reads = []
+    original = cache._read_json
+    monkeypatch.setattr(cache, "_read_json", lambda p: (reads.append(p), original(p))[1])
+    cache.hrv_history(TODAY, days=30)
+    first = len(reads)
+    cache.hrv_history(TODAY, days=30)
+    assert len(reads) == first, "second call re-parsed the sleep payloads"
+
+
+def test_hrv_history_handles_a_missing_data_dir(tmp_path):
+    cache = GarminCache(data_dir=tmp_path / "nope", min_age_days=1)
+    assert cache.hrv_history(TODAY, days=30) == []
+
+
+def test_hrv_history_rejects_an_unparseable_date(data_dir):
+    cache = GarminCache(data_dir=data_dir, min_age_days=1)
+    assert cache.hrv_history("not-a-date") == []
+
+
+def test_hrv_history_is_exposed_on_the_wrapper(client):
+    cached, live = client
+    assert cached.hrv_history(TODAY, days=30) == [62.0]
+    assert live.calls == [], "history must never reach the live client"
+
+
+# -- enriched daily_training_state ----------------------------------------
+#
+# The ingestor now attaches the untouched source responses alongside the six
+# normalized fields, so hrvFactorPercent survives. Days written before that
+# change keep the six-field form and are not backfilled, so both paths matter.
+
+
+def _write_training_state(root, day, extra=None):
+    payload = {
+        "calendarDate": day,
+        "trainingReadiness": 62,
+        "trainingStatusCode": 3,
+        "acuteLoad": 210,
+        "chronicLoad": 190,
+        "loadRatio": 1.1,
+    }
+    payload.update(extra or {})
+    _write(root / "raw" / "daily_training_state" / f"{day}.json", payload)
+
+
+def test_readiness_served_verbatim_when_raw_present(tmp_path, data_dir):
+    day = SETTLED.isoformat()
+    _write_training_state(
+        data_dir,
+        day,
+        {"trainingReadinessRaw": {"score": 62, "hrvFactorPercent": 94, "sleepScore": 80}},
+    )
+    cache = GarminCache(data_dir=data_dir, min_age_days=1)
+    result = cache.get_training_readiness(SETTLED)
+    assert result["hrvFactorPercent"] == 94
+    assert result["sleepScore"] == 80
+    # Exact-tier reads carry no cache markers; a tool cannot tell them from live.
+    assert "_partial" not in result and "_source" not in result
+
+
+def test_readiness_falls_back_to_six_field_form(tmp_path, data_dir):
+    day = SETTLED.isoformat()
+    _write_training_state(data_dir, day)
+    cache = GarminCache(data_dir=data_dir, min_age_days=1)
+    result = cache.get_training_readiness(SETTLED)
+    assert result["trainingReadiness"] == 62
+    assert result["_partial"] is True
+    assert "hrvFactorPercent" not in result
+
+
+def test_readiness_raw_list_shape_served_as_stored(tmp_path, data_dir):
+    """Garmin's own endpoint returns a list; serve whatever was stored, untouched."""
+    day = SETTLED.isoformat()
+    _write_training_state(
+        data_dir, day, {"trainingReadinessRaw": [{"score": 62, "hrvFactorPercent": 94}]}
+    )
+    cache = GarminCache(data_dir=data_dir, min_age_days=1)
+    result = cache.get_training_readiness(SETTLED)
+    assert isinstance(result, list)
+    assert result[0]["hrvFactorPercent"] == 94
+
+
+def test_empty_raw_block_does_not_shadow_the_derived_form(tmp_path, data_dir):
+    day = SETTLED.isoformat()
+    _write_training_state(data_dir, day, {"trainingReadinessRaw": {}})
+    cache = GarminCache(data_dir=data_dir, min_age_days=1)
+    assert cache.get_training_readiness(SETTLED)["trainingReadiness"] == 62
+
+
+def test_training_status_served_verbatim_when_raw_present(tmp_path, data_dir):
+    day = SETTLED.isoformat()
+    _write_training_state(
+        data_dir, day, {"trainingStatusRaw": {"trainingStatusCode": 3, "extraField": "kept"}}
+    )
+    cache = GarminCache(data_dir=data_dir, min_age_days=1)
+    result = cache.get_training_status(SETTLED)
+    assert result["extraField"] == "kept"
+    assert "_partial" not in result
+
+
+def test_training_status_falls_back_to_six_field_form(tmp_path, data_dir):
+    _write_training_state(data_dir, SETTLED.isoformat())
+    cache = GarminCache(data_dir=data_dir, min_age_days=1)
+    result = cache.get_training_status(SETTLED)
+    assert result["acuteLoad"] == 210
+    assert result["_partial"] is True
+
+
+# -- tier is decided per payload, not per method ---------------------------
+#
+# PR #4 review, Medium: listing these only under DERIVED_METHODS meant a stored
+# verbatim payload was discarded whenever GARMIN_CACHE_DERIVED was off, and the
+# call went to Garmin despite an exact copy sitting on disk.
+
+
+def _client_with_training_state(data_dir, db_path, extra, derived):
+    _write(
+        data_dir / "raw" / "daily_training_state" / f"{SETTLED.isoformat()}.json",
+        {
+            "calendarDate": SETTLED.isoformat(),
+            "trainingReadiness": 62,
+            "trainingStatusCode": 3,
+            **extra,
+        },
+    )
+    cache = GarminCache(data_dir=data_dir, db_path=db_path, min_age_days=1)
+    live = FakeClient()
+    return CachedGarminClient(live, cache, enable_derived=derived), live
+
+
+def test_verbatim_readiness_served_with_derived_tier_off(data_dir, db_path):
+    cached, live = _client_with_training_state(
+        data_dir,
+        db_path,
+        {"trainingReadinessRaw": {"score": 62, "hrvFactorPercent": 94}},
+        derived=False,
+    )
+    result = cached.get_training_readiness(SETTLED.isoformat())
+    assert result["hrvFactorPercent"] == 94
+    assert live.calls == [], "an exact copy was on disk; this must not hit Garmin"
+
+
+def test_derived_readiness_still_gated_with_derived_tier_off(data_dir, db_path):
+    cached, live = _client_with_training_state(data_dir, db_path, {}, derived=False)
+    cached.get_training_readiness(SETTLED.isoformat())
+    assert live.calls, "the normalized reconstruction is derived and must be gated"
+
+
+def test_derived_readiness_served_when_derived_tier_on(data_dir, db_path):
+    cached, live = _client_with_training_state(data_dir, db_path, {}, derived=True)
+    result = cached.get_training_readiness(SETTLED.isoformat())
+    assert result["trainingReadiness"] == 62
+    assert live.calls == []
+
+
+def test_verbatim_status_served_with_derived_tier_off(data_dir, db_path):
+    cached, live = _client_with_training_state(
+        data_dir, db_path, {"trainingStatusRaw": {"trainingStatusCode": 3, "extra": "kept"}},
+        derived=False,
+    )
+    assert cached.get_training_status(SETTLED.isoformat())["extra"] == "kept"
+    assert live.calls == []

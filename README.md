@@ -25,7 +25,7 @@ Credits: https://github.com/Taxuspt/garmin_mcp
 
 ## Prerequisites
 
-- Python 3.10+ (3.12 recommended)
+- Python 3.12+ (the container image and the deployed runtime are 3.12)
 - Garmin Connect account credentials
 - For Kubernetes: kubectl access to your cluster
 
@@ -395,12 +395,39 @@ kubectl apply -f httproute.yaml
 
 *Required only if MFA is enabled on your Garmin Connect account, and only on first run or when tokens expire
 
+## API Budget
+
+**Garmin rate-limits hard, and the budget is the binding constraint on this
+server. Make only the calls you actually need.**
+
+Garmin Connect tolerates roughly **90-100 API calls per day** across the whole
+account. Exceeding it does not fail cleanly — calls start erroring, and long
+sessions drop the MCP connection outright. The budget is shared with anything
+else touching the same account, including the ingestor.
+
+Practical rules:
+
+- **Never call a range tool to get one day.** The per-day loops cost 5-7 calls
+  for *every* day in the range, cached or not.
+- **Prefer `get_optimized_health_data` over per-day calls** for any backfill,
+  and take it in monthly chunks rather than one long span.
+- **Ask for the metrics you need**, not the defaults. `get_trends` and
+  `get_period_summary` both take include-lists; every extra metric is another
+  call per day.
+- **Settled dates are nearly free** where the cache covers them; today and
+  yesterday are never cached and always cost live calls. See
+  [Freshness](#freshness).
+- **Watch for `[garmin-cache] WARNING`** in the logs. It means the cache is off
+  and every query is hitting Garmin.
+- **Keep sessions short.** Many sequential calls in one session hit rate
+  limiting or drop the connection.
+
 ## Ingested Data Cache
 
-Garmin Connect tolerates roughly 90-100 API calls per day. Tools that loop over a
-date range (`get_trends`, `detect_anomalies`, `get_optimized_health_data`,
-`get_period_summary`, `get_coach_cues`) spend 5-7 calls *per day of range*, so a
-90-day trend query alone can exhaust the budget several times over.
+Tools that loop over a date range (`detect_anomalies`,
+`get_optimized_health_data`, `get_period_summary`, `get_coach_cues`) spend 5-7
+calls *per day of range*, so a 90-day query alone can exhaust the daily budget
+several times over.
 
 If this server runs alongside a
 [garmin-ingestor](https://github.com/steinarr/personal-ai) deployment, it can
@@ -440,6 +467,18 @@ nothing else is connected and the files disappear — after which a read-only
 mount cannot recreate them. Testing the mount proves nothing about the state you
 will eventually be in.
 
+This no longer fails silently. When SQLite reports `SQLITE_READONLY_DIRECTORY`,
+the server logs once, regardless of `GARMIN_CACHE_VERBOSE`:
+
+```
+[garmin-cache] WARNING: cannot open '/context-db/context_kernel.db' because its
+directory is read-only. ... Activity range caching is OFF and every range query
+is going to the live Garmin API instead.
+```
+
+Seeing that line means the mount is wrong and you are burning the API budget.
+Any other SQLite failure warns once too, with the underlying error.
+
 The cache is **read-through and fail-open**: a miss, an unrecognized argument
 shape, or any cache error falls back to the live API. It is disabled unless
 `GARMIN_CACHE_ENABLED` is set, so existing deployments are unaffected.
@@ -455,10 +494,23 @@ Garmin returned, so tools cannot tell the difference:
 | `get_stats(date)` | `raw/stats/{date}.json` |
 | `get_body_battery(date, date)` | `raw/body_battery/{date}.json` |
 | `get_activities_by_date(start, end)` | SQLite `start_time` index + `raw/activities/{id}.json` |
+| `get_training_readiness(date)` | `raw/daily_training_state/{date}.json` → `trainingReadinessRaw` |
+| `get_training_status(date)` | `raw/daily_training_state/{date}.json` → `trainingStatusRaw` |
 
 `get_stats` and `get_body_battery` require the ingestor's `daily_wellness`
 category (`GARMIN_ENABLE_DAILY_WELLNESS=true`), which is off by default there.
 Only the single-day `get_body_battery` form is cached; wider ranges stay live.
+
+The two training-state calls are exact **only for days written since the
+ingestor started attaching the raw responses (2026-08-07)**. It used to keep
+just six normalized fields and discard the rest, which cost `hrvFactorPercent`
+among others. Earlier days are not backfilled — re-fetching 730 days would cost
+one Garmin call each — so they fall back to the derived form below.
+
+Their tier is therefore decided per day, by what is actually on disk, not per
+method: a stored verbatim payload is exact and served regardless of
+`GARMIN_CACHE_DERIVED`, while the normalized reconstruction honours that flag
+like everything else in the derived tier.
 
 **Derived** (`GARMIN_CACHE_DERIVED`) — the ingestor normalizes these, so the
 response carries only the retained fields and is tagged `"_partial": true`:
@@ -467,8 +519,8 @@ response carries only the retained fields and is tagged `"_partial": true`:
 |------|--------|----------|
 | `get_rhr_day(date)` | raw sleep | `restingHeartRate` |
 | `get_hrv_data(date)` | raw sleep | `avgOvernightHrv`, `hrvStatus`, `hrvData` |
-| `get_training_readiness(date)` | `raw/daily_training_state/` | readiness score |
-| `get_training_status(date)` | `raw/daily_training_state/` | status code, acute/chronic load |
+| `get_training_readiness(date)` | `raw/daily_training_state/` | readiness score — pre-2026-08-07 days only, see above |
+| `get_training_status(date)` | `raw/daily_training_state/` | status code, acute/chronic load — pre-2026-08-07 days only |
 | `get_body_composition(date)` | `raw/body_metrics/` | weight, muscle mass, body fat |
 
 Everything else — `get_stress_data`, `get_max_metrics`, `get_heart_rates`,
@@ -491,10 +543,26 @@ that includes them. The cost is low — that call fetches a whole range in one
 request, unlike the per-day endpoints where each missing date costs its own
 call. Sleep has no gaps.
 
-Three calls in the per-day loops are still uncached because the ingestor does
-not collect them: `get_stress_data`, `get_max_metrics` and `get_heart_rates`.
-Covering them would need another ingestion category on the personal-ai side, at
-further API-call cost there.
+Three calls in the per-day loops are still uncached: `get_stress_data`,
+`get_max_metrics` and `get_heart_rates`. Two of them are genuinely uncollected,
+and covering those would need another ingestion category on the personal-ai
+side, at further API-call cost there.
+
+**`get_stress_data` is the exception, and it is cheap to fix.** The data is
+already on disk. `raw/stats/{date}.json` is stored verbatim and carries
+eighteen stress fields, including the one thing readiness actually reads:
+
+```
+averageStressLevel   maxStressLevel      stressQualifier
+stressDuration       restStressDuration  lowStressDuration
+highStressDuration   mediumStressDuration              (and ten more)
+```
+
+Confirmed on the server 2026-08-07: `averageStressLevel = 23` for a settled
+date. A derived `get_stress_data` mapped from the stored stats payload needs no
+new ingestion category and no additional API call anywhere. It would take a
+settled-date `get_readiness_breakdown` from one live Garmin request to zero,
+since stress is currently the only input to that tool the cache cannot serve.
 
 `get_activities` (most-recent-N) is deliberately never cached. It exists to
 return the newest activities, which is exactly the data a periodically-synced
@@ -580,12 +648,14 @@ already be fixed and needs re-verification rather than debugging.
 characters, which exceeds the MCP result limit. Two-thirds of that is per-minute
 time series; the summary a caller actually wants is about 1% of the payload.
 
-**Succeeds and returns a wrong answer.** `get_readiness_breakdown` reads HRV
-from a field live Garmin does not populate, so the component silently drops out;
-when it does resolve, the 20–100 ms scale rates a normal night at 20/100. It
-only looks correct against cached dates, because the cache flattens HRV to the
-field the code expects. This is the one worth fixing — a broken tool announces
-itself, this one does not.
+**Succeeded and returned a wrong answer — now fixed.**
+`get_readiness_breakdown` read HRV from a field live Garmin does not populate,
+so the component silently dropped out, and the 20–100 ms scale rated a normal
+night at 20/100. It now reads both the live and cached HRV shapes and scores
+against the user's own Garmin baseline, naming the components that actually
+entered the average. The same flat-key read silently blanked HRV in `get_trends`,
+`detect_anomalies`, `get_data_completeness` and `get_period_summary` too, and is
+fixed there as well; see [TOOLS.md](TOOLS.md#known-broken-tools).
 
 ### Kubernetes Issues
 
@@ -800,6 +870,51 @@ Configure your MCP client (OpenWebUI, Claude, etc.) to connect to the `/mcp` end
 - **Token storage**: Tokens are stored locally/on PVC - ensure proper access controls
 - **Network security**: For production, use TLS/HTTPS (terminate at Ingress/Gateway)
 - **Secret rotation**: Rotate Garmin password regularly and update secrets accordingly
+
+## Outstanding work
+
+An index, not a spec — each item is described where it belongs, and this list
+exists only because the backlog was otherwise scattered across two files. Keep
+it short: delete an entry when it is done rather than marking it.
+
+**Costs API budget until fixed**
+
+- **Derive `get_stress_data` from the stored stats payload.** The data is
+  already on disk; this needs no new ingestion and no extra API call. It is the
+  only reason a settled-date `get_readiness_breakdown` still spends a live
+  request. See [Known coverage limits](#known-coverage-limits).
+- **Cap the unbounded date ranges.** The per-day loops accept any range and
+  have no ceiling, so one 365-day call can issue over a thousand requests. See
+  [Unbounded date ranges](#unbounded-date-ranges).
+
+**Tools that do not work**
+
+- **`get_sleep_data` cannot be consumed through MCP** — ~280,000 characters,
+  over the result limit, of which the summary is about 1%. Needs a summary tool
+  or a flag that drops the epoch series.
+- **Five tools fail upstream of this repo** and are marked do-not-debug.
+- **`upload_activity` is a stub** that returns "not supported" while `TOOLS.md`
+  advertises it. Implement or remove.
+
+All three are catalogued in [TOOLS.md](TOOLS.md#known-broken-tools).
+
+**Infrastructure**
+
+- **No CI.** There are 100+ offline tests and nothing runs them automatically.
+  `pyproject.toml` already excludes the credential-requiring scripts, so a
+  minimal `pytest` workflow is close to free. Note that one test skips as root.
+- **Detect the read-only mount at startup**, rather than on the first query
+  that touches the DB. The warning exists; it just fires late.
+
+**Depends on the ingestor (personal-ai), not actionable here**
+
+- `get_max_metrics` and `get_heart_rates` are genuinely uncollected and would
+  need a new ingestion category, at API cost there.
+- `daily_wellness` is off by default, which blocks exact-tier `get_stats` and
+  `get_body_battery`.
+- Only single-day `get_body_battery` is cached; wider ranges stay live.
+- Historical days keep the pre-2026-08-07 six-field training-state record and
+  are deliberately not backfilled.
 
 ## License
 

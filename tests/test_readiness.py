@@ -1,0 +1,828 @@
+"""
+Tests for get_readiness_breakdown and its HRV scoring helpers.
+
+These run without Garmin credentials or network access: the client is a stub
+returning canned payloads in the shapes live Garmin and the ingested-data cache
+actually produce.
+"""
+
+import asyncio
+import json
+
+import pytest
+
+from garmin_mcp import recommendations
+from garmin_mcp.cache import DISK_BACKED_HISTORY
+from garmin_mcp.recommendations import (
+    _average_body_battery,
+    _baseline_from_history,
+    _extract_body_battery_levels,
+    _extract_hrv_baseline,
+    _extract_hrv_value,
+    _first_number,
+    _garmin_hrv_factor,
+    _garmin_readiness_score,
+    _score_hrv_against_baseline,
+)
+
+DATE = "2026-08-01"
+
+# The baseline from the case recorded in TOOLS.md: a 36 ms night that Garmin
+# itself rates BALANCED / 96 GOOD, but the old fixed 20-100 ms scale scored 20.
+BASELINE = {"lowUpper": 32, "balancedLow": 36, "balancedUpper": 55, "markerValue": 0.45}
+
+
+def live_hrv(value=36, baseline=BASELINE):
+    """The shape live Garmin returns: nested under hrvSummary."""
+    summary = {"calendarDate": DATE, "lastNightAvg": value, "weeklyAvg": 42, "status": "BALANCED"}
+    if baseline is not None:
+        summary["baseline"] = baseline
+    return {"hrvSummary": summary, "hrvReadings": []}
+
+
+def real_body_battery(*levels, descriptor=True):
+    """The shape get_body_battery actually returns: one object per day.
+
+    Samples live in bodyBatteryValuesArray as [timestamp, status, level,
+    version] rows — NOT as `bodyBatteryValue` on the top-level rows. An earlier
+    version of this stub invented that flat shape to match what the code read,
+    so every body-battery assertion here passed while the real payload resolved
+    to nothing. tests/test_cache.py has always used the correct shape.
+    """
+    day = {
+        "date": DATE,
+        "bodyBatteryValuesArray": [
+            [1000 + i, "MEASURED", level, 1.0] for i, level in enumerate(levels)
+        ],
+    }
+    if descriptor:
+        day["bodyBatteryValueDescriptorDTOList"] = [
+            {"bodyBatteryValueDescriptorIndex": 0, "bodyBatteryValueDescriptorKey": "timestamp"},
+            {"bodyBatteryValueDescriptorIndex": 1, "bodyBatteryValueDescriptorKey": "bodyBatteryStatus"},
+            {"bodyBatteryValueDescriptorIndex": 2, "bodyBatteryValueDescriptorKey": "bodyBatteryLevel"},
+            {"bodyBatteryValueDescriptorIndex": 3, "bodyBatteryValueDescriptorKey": "bodyBatteryVersion"},
+        ]
+    return [day]
+
+
+def cached_hrv(value=36):
+    """The shape cache.py produces: flattened, no baseline, tagged partial."""
+    return {
+        "avgHrv": value,
+        "average": value,
+        "hrvStatus": "BALANCED",
+        "calendarDate": DATE,
+        "_partial": True,
+    }
+
+
+class StubClient:
+    """Returns canned payloads; any component can be knocked out with None."""
+
+    def __init__(self, sleep=True, body_battery=True, hrv=None, stress=True, readiness=None):
+        self._sleep = sleep
+        self._body_battery = body_battery
+        self._hrv = hrv
+        self._stress = stress
+        self._readiness = readiness
+
+    # Extra reads used by the range tools, not by get_readiness_breakdown.
+    def get_rhr_day(self, cdate, *a, **k):
+        return {"restingHeartRate": 52}
+
+    def get_stats(self, cdate, *a, **k):
+        return {"steps": 9000}
+
+    def get_heart_rates(self, cdate, *a, **k):
+        return {"restingHeartRate": 52}
+
+    def get_sleep_data(self, cdate, *a, **k):
+        if not self._sleep:
+            return None
+        return {"dailySleepDTO": {"sleepTimeSeconds": 8 * 3600}}
+
+    def get_body_battery(self, start, end, *a, **k):
+        if not self._body_battery:
+            return None
+        return real_body_battery(70, 80)
+
+    def get_hrv_data(self, cdate, *a, **k):
+        return self._hrv
+
+    def get_stress_data(self, cdate, *a, **k):
+        if not self._stress:
+            return None
+        return {"avgStressLevel": 25}
+
+    def get_training_readiness(self, cdate, *a, **k):
+        return self._readiness
+
+
+class FakeApp:
+    """Collects the functions register_tools decorates."""
+
+    def __init__(self):
+        self.tools = {}
+
+    def tool(self, *args, **kwargs):
+        def decorator(fn):
+            self.tools[fn.__name__] = fn
+            return fn
+
+        return decorator
+
+
+@pytest.fixture
+def tools():
+    """Registers the tool set once and yields a runner for any tool by name."""
+    app = FakeApp()
+    recommendations.register_tools(app)
+
+    def run(name, client, *args):
+        recommendations.configure(client)
+        return json.loads(asyncio.run(app.tools[name](*args)))
+
+    yield run
+    recommendations.configure(None)
+
+
+@pytest.fixture
+def breakdown(tools):
+    """Returns a caller that configures the stub client and runs the tool."""
+
+    def run(client, date=DATE):
+        return tools("get_readiness_breakdown", client, date)
+
+    return run
+
+
+# --- HRV value extraction -------------------------------------------------
+
+
+def test_hrv_read_from_live_nested_shape():
+    """The regression: reading only the flat keys returned None on live data."""
+    assert _extract_hrv_value(live_hrv(36)) == 36.0
+
+
+def test_hrv_read_from_cached_flat_shape():
+    assert _extract_hrv_value(cached_hrv(36)) == 36.0
+
+
+def test_hrv_live_shape_preferred_over_stale_flat_key():
+    payload = live_hrv(36)
+    payload["avgHrv"] = 99
+    assert _extract_hrv_value(payload) == 36.0
+
+
+def test_hrv_missing_returns_none():
+    assert _extract_hrv_value({"hrvSummary": {}}) is None
+    assert _extract_hrv_value(None) is None
+    assert _extract_hrv_value("not a dict") is None
+
+
+def test_first_number_keeps_a_real_zero():
+    """`a or b` would skip 0 here and fall through to the next candidate."""
+    assert _first_number(0, 42) == 0.0
+    assert _first_number(None, 42) == 42.0
+    assert _first_number(True, 7) == 7.0
+    assert _first_number(None, None) is None
+
+
+# --- Baseline scoring -----------------------------------------------------
+
+
+def test_baseline_extracted_from_live_payload():
+    baseline = _extract_hrv_baseline(live_hrv())
+    assert baseline == {"low_upper": 32.0, "balanced_low": 36.0, "balanced_upper": 55.0}
+
+
+def test_baseline_absent_from_cached_payload():
+    assert _extract_hrv_baseline(cached_hrv()) is None
+
+
+def test_baseline_rejected_when_band_is_degenerate():
+    assert _extract_hrv_baseline(live_hrv(baseline={"balancedLow": 50, "balancedUpper": 50})) is None
+
+
+def test_balanced_night_no_longer_scores_as_failure():
+    """The documented defect: 36 ms scored 20/100 on the old fixed scale."""
+    baseline = _extract_hrv_baseline(live_hrv())
+    assert _score_hrv_against_baseline(36.0, baseline) == 60.0
+
+
+def test_baseline_scoring_spans_the_balanced_band():
+    baseline = _extract_hrv_baseline(live_hrv())
+    assert _score_hrv_against_baseline(55.0, baseline) == 90.0
+    mid = _score_hrv_against_baseline(45.5, baseline)
+    assert 70.0 < mid < 80.0
+
+
+def test_baseline_scoring_is_monotonic():
+    baseline = _extract_hrv_baseline(live_hrv())
+    scores = [_score_hrv_against_baseline(v, baseline) for v in range(10, 90, 2)]
+    assert scores == sorted(scores)
+    assert all(0.0 <= s <= 100.0 for s in scores)
+
+
+def test_low_hrv_still_scores_low():
+    baseline = _extract_hrv_baseline(live_hrv())
+    assert _score_hrv_against_baseline(20.0, baseline) < 20.0
+    assert _score_hrv_against_baseline(5.0, baseline) == 0.0
+
+
+# --- Garmin's own numbers -------------------------------------------------
+
+
+def test_garmin_factors_read_from_list_shape():
+    payload = [{"score": 72, "hrvFactorPercent": 96, "sleepScore": 80}]
+    assert _garmin_readiness_score(payload) == 72.0
+    assert _garmin_hrv_factor(payload) == 96.0
+
+
+def test_garmin_readiness_read_from_cached_dict_shape():
+    payload = {"score": 64, "trainingReadiness": 64, "_partial": True}
+    assert _garmin_readiness_score(payload) == 64.0
+    assert _garmin_hrv_factor(payload) is None
+
+
+def test_garmin_readiness_read_from_nested_shape():
+    assert _garmin_readiness_score({"trainingReadiness": {"value": 55}}) == 55.0
+
+
+def test_garmin_factors_tolerate_empty_payloads():
+    for payload in ([], None, {}, "unexpected"):
+        assert _garmin_readiness_score(payload) is None
+        assert _garmin_hrv_factor(payload) is None
+
+
+# --- The tool end to end --------------------------------------------------
+
+
+def test_hrv_component_resolves_on_live_data(breakdown):
+    """Before the fix this component was None on every live call."""
+    result = breakdown(StubClient(hrv=live_hrv(36)))
+    assert result["components"]["hrv_score"] is not None
+    assert result["hrv_ms"] == 36.0
+    assert result["components_missing"] == []
+    assert set(result["components_used"]) == {
+        "sleep_score",
+        "body_battery_score",
+        "hrv_score",
+        "stress_inverse_score",
+    }
+
+
+def test_garmin_hrv_factor_wins_when_available(breakdown):
+    result = breakdown(
+        StubClient(hrv=live_hrv(36), readiness=[{"score": 72, "hrvFactorPercent": 96}])
+    )
+    assert result["components"]["hrv_score"] == 96.0
+    assert result["hrv_scoring_method"] == "garmin_hrv_factor"
+    assert result["garmin_training_readiness"] == 72.0
+
+
+def test_personal_baseline_used_without_garmin_factor(breakdown):
+    result = breakdown(StubClient(hrv=live_hrv(36)))
+    assert result["hrv_scoring_method"] == "personal_baseline"
+    assert result["components"]["hrv_score"] == 60.0
+
+
+def test_cached_payload_falls_back_to_population_scale(breakdown):
+    """No baseline is stored in the cache, so scoring says so rather than guessing quietly."""
+    result = breakdown(StubClient(hrv=cached_hrv(36)))
+    assert result["hrv_scoring_method"] == "population_scale_approximate"
+    assert result["components"]["hrv_score"] is not None
+
+
+def test_missing_hrv_is_named_not_hidden(breakdown):
+    """The composite silently became a 3-way average; now it reports which 3."""
+    result = breakdown(StubClient(hrv=None))
+    assert result["components"]["hrv_score"] is None
+    assert result["components_missing"] == ["hrv_score"]
+    assert "hrv_score" not in result["components_used"]
+    assert len(result["components_used"]) == 3
+
+
+def test_composite_averages_only_resolved_components(breakdown):
+    result = breakdown(StubClient(hrv=None, stress=False))
+    used = result["components_used"]
+    expected = sum(result["components"][name] for name in used) / len(used)
+    assert result["readiness_score"] == pytest.approx(round(expected, 2))
+
+
+def test_no_components_yields_null_readiness(breakdown):
+    result = breakdown(StubClient(sleep=False, body_battery=False, hrv=None, stress=False))
+    assert result["readiness_score"] is None
+    assert result["components_used"] == []
+    assert len(result["components_missing"]) == 4
+
+
+def test_failing_readiness_call_does_not_break_the_tool(breakdown):
+    class Exploding(StubClient):
+        def get_training_readiness(self, cdate, *a, **k):
+            raise RuntimeError("garmin said no")
+
+    result = breakdown(Exploding(hrv=live_hrv(36)))
+    assert result["garmin_training_readiness"] is None
+    assert result["components"]["hrv_score"] == 60.0
+
+
+def test_invalid_date_is_rejected(breakdown):
+    recommendations.configure(StubClient())
+    app = FakeApp()
+    recommendations.register_tools(app)
+    out = asyncio.run(app.tools["get_readiness_breakdown"]("not-a-date"))
+    assert "Invalid date" in out
+
+
+# --- The other four call sites of the same defect -------------------------
+#
+# get_trends, detect_anomalies, get_period_summary and get_data_completeness
+# each read HRV with the same flat-key pattern. Every one of them returned
+# None/False for HRV on live payloads before the shared helper landed.
+
+RANGE_START = "2026-08-01"
+RANGE_END = "2026-08-02"
+
+
+def test_trends_reads_live_hrv(tools):
+    result = tools("get_trends", StubClient(hrv=live_hrv(36)), RANGE_START, RANGE_END, ["hrv"])
+    assert result["series"]
+    assert all(day["hrv"] == 36.0 for day in result["series"])
+
+
+def test_trends_still_reads_the_cached_shape(tools):
+    """The cached flat shape worked throughout; guard against regressing it."""
+    result = tools("get_trends", StubClient(hrv=cached_hrv(36)), RANGE_START, RANGE_END, ["hrv"])
+    assert all(day["hrv"] == 36.0 for day in result["series"])
+
+
+def test_detect_anomalies_flags_an_hrv_drop_on_live_data(tools):
+    """With HRV stuck at None, no drop could ever be detected — the flag is the proof."""
+
+    class PerDayHrv(StubClient):
+        def get_hrv_data(self, cdate, *a, **k):
+            return live_hrv(30 if cdate == "2026-08-05" else 60)
+
+    result = tools("detect_anomalies", PerDayHrv(), "2026-08-01", "2026-08-05")
+    flagged = {day["date"]: day["flags"] for day in result["anomalies"]}
+    assert "hrv_depressed" in flagged.get("2026-08-05", [])
+
+
+def test_detect_anomalies_finds_no_drop_when_hrv_is_steady(tools):
+    result = tools("detect_anomalies", StubClient(hrv=live_hrv(60)), "2026-08-01", "2026-08-05")
+    for day in result["anomalies"]:
+        assert "hrv_depressed" not in day["flags"]
+
+
+def test_data_completeness_counts_live_hrv_as_present(tools):
+    result = tools("get_data_completeness", StubClient(hrv=live_hrv(36)), RANGE_START, RANGE_END)
+    assert all(day["signals"]["hrv"] is True for day in result["daily"])
+
+
+def test_data_completeness_reports_absent_hrv(tools):
+    result = tools("get_data_completeness", StubClient(hrv=None), RANGE_START, RANGE_END)
+    assert all(day["signals"]["hrv"] is False for day in result["daily"])
+
+
+def test_data_completeness_still_reads_the_cached_shape(tools):
+    result = tools("get_data_completeness", StubClient(hrv=cached_hrv(36)), RANGE_START, RANGE_END)
+    assert all(day["signals"]["hrv"] is True for day in result["daily"])
+
+
+def test_period_summary_aggregates_live_hrv(tools):
+    """avg_hrv is omitted entirely when no value resolves, so its presence is the assertion."""
+
+    class WithActivities(StubClient):
+        def get_activities_by_date(self, start, end, *a, **k):
+            return []
+
+    client = WithActivities(hrv=live_hrv(36))
+    result = tools("get_period_summary", client, "daily", RANGE_START, True, True, True, True, True, True)
+    assert result["aggregates"]["avg_hrv"] == 36.0
+
+
+def test_period_summary_omits_hrv_when_absent(tools):
+    class WithActivities(StubClient):
+        def get_activities_by_date(self, start, end, *a, **k):
+            return []
+
+    client = WithActivities(hrv=None)
+    result = tools("get_period_summary", client, "daily", RANGE_START, True, True, True, True, True, True)
+    assert "avg_hrv" not in result["aggregates"]
+
+
+# --- Body battery ---------------------------------------------------------
+#
+# Found in production by the components_missing field added above: a settled
+# date returned body_battery_score null even though the cached payload existed.
+
+
+def test_levels_read_from_the_real_nested_shape():
+    assert _extract_body_battery_levels(real_body_battery(70, 80)) == [70.0, 80.0]
+
+
+def test_flat_top_level_key_matches_nothing():
+    """The shape the old code looked for. It is not what Garmin returns."""
+    assert _extract_body_battery_levels([{"bodyBatteryValue": 70}]) == [70.0]
+    assert _extract_body_battery_levels([{"date": DATE, "charged": 45, "drained": 60}]) == []
+
+
+def test_descriptor_overrides_the_positional_default():
+    payload = real_body_battery(descriptor=False)
+    payload[0]["bodyBatteryValuesArray"] = [[1000, 55, "MEASURED", 1.0]]
+    payload[0]["bodyBatteryValueDescriptorDTOList"] = [
+        {"bodyBatteryValueDescriptorIndex": 1, "bodyBatteryValueDescriptorKey": "bodyBatteryLevel"},
+    ]
+    assert _extract_body_battery_levels(payload) == [55.0]
+
+
+def test_positional_default_used_without_a_descriptor():
+    assert _extract_body_battery_levels(real_body_battery(64, descriptor=False)) == [64.0]
+
+
+def test_levels_collected_across_multiple_days():
+    payload = real_body_battery(70, 80) + real_body_battery(30)
+    assert _extract_body_battery_levels(payload) == [70.0, 80.0, 30.0]
+
+
+def test_malformed_payloads_yield_no_levels():
+    assert _extract_body_battery_levels(None) == []
+    assert _extract_body_battery_levels({"not": "a list"}) == []
+    assert _extract_body_battery_levels([{"bodyBatteryValuesArray": "nope"}]) == []
+    assert _extract_body_battery_levels([{"bodyBatteryValuesArray": [[1000]]}]) == []
+
+
+def test_average_is_none_when_there_are_no_samples():
+    assert _average_body_battery([]) is None
+    assert _average_body_battery(real_body_battery()) is None
+    assert _average_body_battery(real_body_battery(70, 80)) == 75.0
+
+
+def test_readiness_resolves_body_battery_on_the_real_shape(tools):
+    """The production symptom: body_battery_score was null with a payload present."""
+    result = tools("get_readiness_breakdown", StubClient(hrv=live_hrv(36)), DATE)
+    assert result["components"]["body_battery_score"] == 75.0
+    assert "body_battery_score" in result["components_used"]
+    assert "body_battery_score" not in result["components_missing"]
+
+
+def test_trends_averages_body_battery_on_the_real_shape(tools):
+    result = tools(
+        "get_trends", StubClient(hrv=live_hrv(36)), RANGE_START, RANGE_END, ["body_battery"]
+    )
+    assert all(day["body_battery_avg"] == 75.0 for day in result["series"])
+
+
+def test_period_summary_aggregates_body_battery(tools):
+    class WithActivities(StubClient):
+        def get_activities_by_date(self, start, end, *a, **k):
+            return []
+
+    result = tools(
+        "get_period_summary", WithActivities(), "daily", RANGE_START, True, True, True, True, True, True
+    )
+    assert result["aggregates"]["avg_body_battery"] == 75.0
+
+
+# --- Personal baseline from stored history --------------------------------
+#
+# Cached dates carry no hrvSummary.baseline, because the ingestor stores no HRV
+# endpoint response for one to come from. Before this, they fell to a fixed
+# 20-70ms scale that rated a real 40ms night 40/100 where Garmin said 94.
+
+# Roughly the distribution behind the server's observed 29-40ms readings.
+# 30 nights: the floor is 28, since at 14 the 10th percentile is decided by
+# the second and third lowest readings alone.
+HISTORY = [
+    26, 27, 28, 28, 29, 29, 30, 30, 31, 31,
+    32, 32, 33, 33, 34, 34, 35, 35, 36, 36,
+    37, 38, 38, 39, 40, 41, 42, 43, 44, 46,
+]
+
+
+class HistoryClient(StubClient):
+    """A cached client: declares a disk-backed history source and provides one."""
+
+    hrv_history_source = DISK_BACKED_HISTORY
+
+    def __init__(self, history=None, **kwargs):
+        super().__init__(**kwargs)
+        self._history = HISTORY if history is None else history
+        self.history_calls = 0
+
+    def hrv_history(self, end_day, days=None):
+        self.history_calls += 1
+        return list(self._history)
+
+
+def test_history_baseline_bands_come_from_percentiles():
+    baseline = _baseline_from_history(HISTORY)
+    assert baseline["low_upper"] < baseline["balanced_low"] < baseline["balanced_upper"]
+    assert baseline["low_upper"] == pytest.approx(28.0)
+    assert baseline["balanced_low"] == pytest.approx(30.25)
+    assert baseline["balanced_upper"] == pytest.approx(38.0)
+
+
+def test_history_baseline_needs_enough_nights():
+    assert _baseline_from_history([30, 31, 32]) is None
+    assert _baseline_from_history(HISTORY[:27]) is None, "27 nights is below the floor"
+    assert _baseline_from_history([]) is None
+
+
+def test_history_baseline_rejects_a_flat_series():
+    """Thirty identical readings describe no band worth scoring against."""
+    assert _baseline_from_history([33.0] * 30) is None
+
+
+def test_history_baseline_rescues_the_underrated_night():
+    """40ms scored 40 on the population scale; Garmin's own factor called it 94."""
+    baseline = _baseline_from_history(HISTORY)
+    population = (40.0 - 20.0) / (70.0 - 20.0) * 100.0
+    assert population == 40.0
+    assert _score_hrv_against_baseline(40.0, baseline) > 90.0
+
+
+def test_history_baseline_used_when_payload_has_none(breakdown):
+    client = HistoryClient(hrv=cached_hrv(40))
+    result = breakdown(client)
+    assert result["hrv_scoring_method"] == "stored_history_approximate"
+    assert result["components"]["hrv_score"] > 90.0
+    assert client.history_calls == 1
+
+
+def test_live_baseline_still_preferred_over_history(breakdown):
+    result = breakdown(HistoryClient(hrv=live_hrv(36)))
+    assert result["hrv_scoring_method"] == "personal_baseline"
+
+
+def test_garmin_factor_still_beats_both(breakdown):
+    client = HistoryClient(hrv=live_hrv(36), readiness=[{"score": 72, "hrvFactorPercent": 96}])
+    result = breakdown(client)
+    assert result["hrv_scoring_method"] == "garmin_hrv_factor"
+    assert client.history_calls == 0
+
+
+def test_population_scale_when_history_is_too_short(breakdown):
+    result = breakdown(HistoryClient(history=HISTORY[:27], hrv=cached_hrv(40)))
+    assert result["hrv_scoring_method"] == "population_scale_approximate"
+
+
+def test_uncached_client_never_gets_history(breakdown):
+    """A plain client has no hrv_history, so nothing can fan out into API calls."""
+    result = breakdown(StubClient(hrv=cached_hrv(40)))
+    assert result["hrv_scoring_method"] == "population_scale_approximate"
+
+
+def test_history_failure_falls_through_quietly(breakdown):
+    class Exploding(HistoryClient):
+        def hrv_history(self, end_day, days=None):
+            raise RuntimeError("disk gone")
+
+    result = breakdown(Exploding(hrv=cached_hrv(40)))
+    assert result["hrv_scoring_method"] == "population_scale_approximate"
+    assert result["components"]["hrv_score"] == 40.0
+
+
+def test_cached_date_uses_garmin_factor_once_the_ingestor_supplies_it(breakdown):
+    """The ingestor now stores trainingReadinessRaw, so cached dates get the real factor.
+
+    Before, a settled date had only the readiness scalar and fell through to a
+    history or population baseline. This is the top scoring tier reached
+    without a single live Garmin call.
+    """
+    client = HistoryClient(
+        hrv=cached_hrv(40),
+        readiness={"score": 62, "hrvFactorPercent": 94, "sleepScore": 80},
+    )
+    result = breakdown(client)
+    assert result["hrv_scoring_method"] == "garmin_hrv_factor"
+    assert result["components"]["hrv_score"] == 94.0
+    assert result["garmin_training_readiness"] == 62.0
+    assert client.history_calls == 0, "no need to build a baseline when Garmin supplies one"
+
+
+def test_history_still_covers_days_written_before_the_ingestor_change(breakdown):
+    """Historical days are not backfilled, so the fallback still has to work."""
+    client = HistoryClient(
+        hrv=cached_hrv(40),
+        readiness={"score": 62, "trainingReadiness": 62, "_partial": True},
+    )
+    result = breakdown(client)
+    assert result["hrv_scoring_method"] == "stored_history_approximate"
+    assert result["components"]["hrv_score"] > 90.0
+    assert result["garmin_training_readiness"] == 62.0
+
+
+# --- Review findings ------------------------------------------------------
+
+
+def test_garmin_factor_survives_a_failing_hrv_call(breakdown):
+    """PR #4 review, High: the factor was applied inside the HRV call's try.
+
+    A raising get_hrv_data discarded a factor already in hand, and the
+    swallowing except turned that into a null component.
+    """
+
+    class NoHrv(StubClient):
+        def get_hrv_data(self, cdate, *a, **k):
+            raise RuntimeError("garmin said no")
+
+    result = breakdown(NoHrv(readiness=[{"score": 72, "hrvFactorPercent": 96}]))
+    assert result["components"]["hrv_score"] == 96.0
+    assert result["hrv_scoring_method"] == "garmin_hrv_factor"
+    assert result["components_missing"] == []
+    # The measurement itself is genuinely unavailable, and says so.
+    assert result["hrv_ms"] is None
+
+
+def test_failing_hrv_call_without_a_factor_is_still_missing(breakdown):
+    class NoHrv(StubClient):
+        def get_hrv_data(self, cdate, *a, **k):
+            raise RuntimeError("garmin said no")
+
+    result = breakdown(NoHrv())
+    assert result["components"]["hrv_score"] is None
+    assert result["components_missing"] == ["hrv_score"]
+
+
+def test_history_tier_reports_its_sample_count(breakdown):
+    """PR #4 review, Medium: an approximate tier should show its evidence."""
+    result = breakdown(HistoryClient(hrv=cached_hrv(40)))
+    assert result["hrv_scoring_method"] == "stored_history_approximate"
+    assert result["hrv_baseline_samples"] == len(HISTORY)
+
+
+def test_sample_count_absent_for_the_trusted_tiers(breakdown):
+    result = breakdown(HistoryClient(hrv=live_hrv(36)))
+    assert result["hrv_scoring_method"] == "personal_baseline"
+    assert result["hrv_baseline_samples"] is None
+
+
+def test_misordered_band_is_rejected():
+    """PR #4 review, Low: a bad band yielded a nonsense score rather than None."""
+    assert _extract_hrv_baseline(live_hrv(baseline={
+        "lowUpper": 60, "balancedLow": 36, "balancedUpper": 55,
+    })) is None
+
+
+def test_non_finite_band_is_rejected():
+    assert _extract_hrv_baseline(live_hrv(baseline={
+        "lowUpper": 32, "balancedLow": float("nan"), "balancedUpper": 55,
+    })) is None
+    assert _extract_hrv_baseline(live_hrv(baseline={
+        "lowUpper": 32, "balancedLow": 36, "balancedUpper": float("inf"),
+    })) is None
+
+
+def test_negative_band_is_rejected():
+    assert _extract_hrv_baseline(live_hrv(baseline={
+        "lowUpper": -5, "balancedLow": 36, "balancedUpper": 55,
+    })) is None
+
+
+def test_negative_descriptor_index_does_not_wrap():
+    """PR #4 review, Low: index -1 read the version column as a battery level."""
+    payload = real_body_battery(descriptor=False)
+    payload[0]["bodyBatteryValuesArray"] = [[1000, "MEASURED", 55, 1.0]]
+    payload[0]["bodyBatteryValueDescriptorDTOList"] = [
+        {"bodyBatteryValueDescriptorIndex": -1, "bodyBatteryValueDescriptorKey": "bodyBatteryLevel"},
+    ]
+    # Falls back to the positional default rather than reading row[-1] == 1.0.
+    assert _extract_body_battery_levels(payload) == [55.0]
+
+
+def test_boolean_descriptor_index_is_rejected():
+    payload = real_body_battery(descriptor=False)
+    payload[0]["bodyBatteryValuesArray"] = [[1000, "MEASURED", 55, 1.0]]
+    payload[0]["bodyBatteryValueDescriptorDTOList"] = [
+        {"bodyBatteryValueDescriptorIndex": True, "bodyBatteryValueDescriptorKey": "bodyBatteryLevel"},
+    ]
+    assert _extract_body_battery_levels(payload) == [55.0]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [{"score": 55, "hrvFactorPercent": 90}],
+        {"score": 55},
+        {"trainingReadiness": {"value": 55}},
+        {"score": 55, "trainingReadiness": 55, "_partial": True},
+    ],
+    ids=["live_list", "raw_dict", "nested_dict", "derived_scalar"],
+)
+def test_range_tools_read_every_readiness_shape(tools, payload):
+    """PR #4 review, Medium: three callers parsed only the nested dict.
+
+    The derived scalar was the worst of them — .get("value") on an int raised.
+    """
+
+    class Readiness(StubClient):
+        def get_activities_by_date(self, start, end, *a, **k):
+            return []
+
+        def get_training_readiness(self, cdate, *a, **k):
+            return payload
+
+    result = tools(
+        "get_period_summary", Readiness(), "daily", RANGE_START, True, True, True, True, True, True
+    )
+    assert result["aggregates"]["avg_training_readiness"] == 55.0
+
+
+def _band(**kwargs):
+    return _extract_hrv_baseline({"hrvSummary": {"baseline": kwargs}})
+
+
+def test_missing_low_upper_band_is_still_accepted():
+    """Garmin omitting lowUpper is a usable band, not a malformed one.
+
+    Rejecting it would drop a real personal baseline down to a weaker tier.
+    """
+    assert _band(balancedLow=36, balancedUpper=55) == {
+        "low_upper": 36.0,
+        "balanced_low": 36.0,
+        "balanced_upper": 55.0,
+    }
+
+
+def test_missing_low_upper_scores_continuously():
+    """PR #4 re-review, P3: 35.999ms scored 40 and 36.000ms scored 60.
+
+    A fifth of the HRV component, and five points of the composite, decided by
+    a rounding difference.
+    """
+    baseline = _band(balancedLow=36, balancedUpper=55)
+    below = _score_hrv_against_baseline(35.999, baseline)
+    at = _score_hrv_against_baseline(36.0, baseline)
+    assert at == 60.0
+    assert abs(at - below) < 0.5
+
+
+def test_present_low_upper_still_scores_continuously():
+    baseline = _band(lowUpper=32, balancedLow=36, balancedUpper=55)
+    for boundary in (32.0, 36.0, 55.0):
+        below = _score_hrv_against_baseline(boundary - 0.001, baseline)
+        at = _score_hrv_against_baseline(boundary, baseline)
+        assert abs(at - below) < 0.5, f"discontinuity at {boundary}"
+
+
+@pytest.mark.parametrize(
+    "baseline_kwargs",
+    [
+        {"balancedLow": 36, "balancedUpper": 55},
+        {"lowUpper": 32, "balancedLow": 36, "balancedUpper": 55},
+        {"lowUpper": 2, "balancedLow": 3, "balancedUpper": 6},
+    ],
+    ids=["no_low_upper", "full_band", "small_values"],
+)
+def test_scoring_curve_is_monotonic_and_bounded(baseline_kwargs):
+    """Small values matter: the sub-balanced ramp inverts if the floor rises above it."""
+    baseline = _band(**baseline_kwargs)
+    assert baseline is not None
+    scores = [_score_hrv_against_baseline(v / 100, baseline) for v in range(10, 9000)]
+    assert scores == sorted(scores)
+    assert all(0.0 <= s <= 100.0 for s in scores)
+
+
+def test_history_ignored_when_the_source_is_not_declared(breakdown):
+    """The capability gate: having the method is not enough, it must declare itself.
+
+    This asks for a whole window of days at once, so a source that turned out
+    to hit the network would spend most of a day's Garmin budget in one call.
+    A forwarding proxy can satisfy a method name; it cannot satisfy an identity
+    check against a private sentinel.
+    """
+
+    class UndeclaredHistory(StubClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.history_calls = 0
+
+        def hrv_history(self, end_day, days=None):
+            self.history_calls += 1
+            return list(HISTORY)
+
+    client = UndeclaredHistory(hrv=cached_hrv(40))
+    result = breakdown(client)
+    assert result["hrv_scoring_method"] == "population_scale_approximate"
+    assert client.history_calls == 0, "an undeclared source must not even be called"
+
+
+def test_a_truthy_marker_is_not_enough(breakdown):
+    """A proxy answering every attribute truthily must still be refused."""
+
+    class TruthyProxy(StubClient):
+        hrv_history_source = True
+
+        def hrv_history(self, end_day, days=None):
+            raise AssertionError("must not be called")
+
+    result = breakdown(TruthyProxy(hrv=cached_hrv(40)))
+    assert result["hrv_scoring_method"] == "population_scale_approximate"
+
+
+def test_the_real_wrapper_declares_the_marker():
+    from garmin_mcp.cached_client import CachedGarminClient
+
+    assert CachedGarminClient.hrv_history_source is DISK_BACKED_HISTORY

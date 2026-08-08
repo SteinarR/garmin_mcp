@@ -37,6 +37,49 @@ SOURCE_VALUE = "garmin-ingestor-cache"
 # cache regardless of the configured floor.
 TRAINING_STATE_MIN_AGE_DAYS = 2
 
+# Identity marker for "this object's hrv_history reads stored files and issues
+# no Garmin request". Callers compare it with `is`, not for truthiness: a proxy
+# that answers every attribute with a truthy stub — a mock, a metrics wrapper, a
+# retry layer that forwards unknown calls onward — cannot accidentally satisfy
+# an identity check against a private object.
+#
+# Worth the ceremony because the failure is silent and expensive. Matching on
+# the method name alone would let a future forwarding wrapper turn one baseline
+# lookup into 60 live Garmin calls, against a budget of roughly 90-100 a day,
+# with nothing at the call site looking any different.
+DISK_BACKED_HISTORY = object()
+
+# Window used to build a personal HRV baseline from stored sleep payloads.
+# Roughly matches the span Garmin's own baseline covers, and each day costs one
+# large JSON parse, so results are memoised.
+HRV_HISTORY_DAYS = 60
+HRV_HISTORY_MEMO_MAX = 32
+
+
+def _default_warning(message):
+    print(f"[garmin-cache] WARNING: {message}")
+
+
+def _is_readonly_directory_error(exc):
+    """True when SQLite failed because it cannot write beside the database.
+
+    Opening a WAL database needs a `-shm` file in the database's directory. A
+    read-only mount cannot create one, and SQLite reports that as
+    SQLITE_READONLY_DIRECTORY. This is worth singling out because it looks like
+    a working mount right up until it isn't: `-wal` and `-shm` survive on disk
+    only while some connection holds them open, so a read-only mount reuses the
+    files another container left behind and reads fine. Stop that container
+    while nothing else is connected, the files go away, and every query here
+    starts failing — silently, as a fallback to the live Garmin API.
+    """
+    # sqlite3 sets sqlite_errorname only on exceptions it raises itself; one
+    # constructed by hand (a test, a re-raise) carries the message and nothing
+    # else. Hence the fallback — it is not about Python version support.
+    name = getattr(exc, "sqlite_errorname", None)
+    if name is not None:
+        return name == "SQLITE_READONLY_DIRECTORY"
+    return "attempt to write a readonly database" in str(exc)
+
 
 def _as_date(value):
     """Coerce a date, datetime or YYYY-MM-DD string to a date. None if invalid."""
@@ -55,18 +98,32 @@ def _as_date(value):
 class GarminCache:
     """Reads ingested Garmin payloads from disk and the context SQLite DB."""
 
-    def __init__(self, data_dir, db_path=None, min_age_days=1):
+    def __init__(self, data_dir, db_path=None, min_age_days=1, on_warning=None):
         self.data_dir = Path(os.path.expanduser(str(data_dir)))
         self.db_path = Path(os.path.expanduser(str(db_path))) if db_path else None
         self.min_age_days = max(0, int(min_age_days))
         self._lock = threading.Lock()
         self.stats = {"hit": 0, "miss": 0, "skip": 0, "error": 0}
+        # Deliberately not gated on GARMIN_CACHE_VERBOSE: these warn about
+        # misconfiguration that is otherwise invisible, and verbose is meant to
+        # stay off in normal operation.
+        self._on_warning = on_warning if callable(on_warning) else _default_warning
+        self._warned = set()
+        self._hrv_history_memo = {}
 
     # -- bookkeeping ------------------------------------------------------
 
     def _count(self, outcome):
         with self._lock:
             self.stats[outcome] = self.stats.get(outcome, 0) + 1
+
+    def _warn_once(self, key, message):
+        """Emit `message` the first time `key` is seen. Queries repeat; this must not."""
+        with self._lock:
+            if key in self._warned:
+                return
+            self._warned.add(key)
+        self._on_warning(message)
 
     def is_cacheable_date(self, day, min_age_days=None):
         """True when `day` is old enough that the ingestor has settled data for it."""
@@ -114,8 +171,25 @@ class GarminCache:
             )
             conn.row_factory = sqlite3.Row
             return conn.execute(sql, params).fetchall()
-        except sqlite3.Error:
+        except sqlite3.Error as exc:
             self._count("error")
+            if _is_readonly_directory_error(exc):
+                self._warn_once(
+                    "readonly_directory",
+                    f"cannot open '{self.db_path}' because its directory is "
+                    "read-only. SQLite needs to create a -shm file next to a WAL "
+                    "database. Activity range caching is OFF and every range "
+                    "query is going to the live Garmin API instead. Mount the "
+                    "directory holding the context DB read-write; the connection "
+                    "itself stays mode=ro, so this server still cannot write to "
+                    "the database.",
+                )
+            else:
+                self._warn_once(
+                    "sqlite_error",
+                    f"query against '{self.db_path}' failed ({exc}). Activity "
+                    "range caching is falling back to the live Garmin API.",
+                )
             return []
         finally:
             if conn is not None:
@@ -209,14 +283,71 @@ class GarminCache:
             result["hrvReadings"] = payload["hrvData"]
         return result
 
+    def hrv_history(self, end_day, days=HRV_HISTORY_DAYS):
+        """Overnight HRV values from the stored sleep payloads, oldest first.
+
+        Reads disk and nothing else. There is deliberately no live fallback:
+        callers use this to build a personal baseline, and quietly turning that
+        into `days` Garmin requests would blow the daily API budget outright.
+
+        Days with no stored payload are skipped rather than interpolated, so a
+        gappy window yields fewer values instead of wrong ones.
+        """
+        end_day = _as_date(end_day)
+        if end_day is None:
+            return []
+        days = max(1, int(days))
+        key = (end_day.isoformat(), days)
+        with self._lock:
+            hit = self._hrv_history_memo.get(key)
+        if hit is not None:
+            return list(hit)
+
+        values = []
+        # Start at the day before `end_day`: a baseline should not include the
+        # night it is being used to judge.
+        for offset in range(1, days + 1):
+            day = end_day - datetime.timedelta(days=offset)
+            payload = self.read_raw("sleep", day.isoformat())
+            if not isinstance(payload, dict):
+                continue
+            value = payload.get("avgOvernightHrv")
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            values.append(float(value))
+        values.reverse()
+
+        with self._lock:
+            # Each entry parses up to `days` sleep payloads, which are large.
+            # Bound the memo rather than let a long-lived process accumulate one
+            # entry per date ever queried.
+            if len(self._hrv_history_memo) >= HRV_HISTORY_MEMO_MAX:
+                self._hrv_history_memo.clear()
+            self._hrv_history_memo[key] = list(values)
+        return values
+
     def _daily_training_state(self, day):
         payload = self.read_raw("daily_training_state", day.isoformat())
         return payload if isinstance(payload, dict) else None
 
     def get_training_readiness(self, day):
-        """Derived: the ingestor keeps only the trainingReadiness scalar."""
+        """Exact where the ingestor stored the raw response, derived otherwise.
+
+        Payloads written since the ingestor stopped discarding it carry
+        `trainingReadinessRaw`: the untouched readiness response, including the
+        `hrvFactorPercent` that lets HRV be scored the way Garmin scores it.
+        Serve that verbatim and unmarked, like any other exact-tier read.
+
+        Older days only ever had the normalised scalar and are not backfilled,
+        so the derived form below still covers the historical tail.
+        """
         payload = self._daily_training_state(day)
-        if not payload or payload.get("trainingReadiness") is None:
+        if not payload:
+            return None
+        raw = payload.get("trainingReadinessRaw")
+        if raw:
+            return raw
+        if payload.get("trainingReadiness") is None:
             return None
         return {
             "score": payload["trainingReadiness"],
@@ -227,9 +358,14 @@ class GarminCache:
         }
 
     def get_training_status(self, day):
-        """Derived: training status code plus the acute/chronic load figures."""
+        """Exact where `trainingStatusRaw` is present, derived otherwise."""
         payload = self._daily_training_state(day)
-        if not payload or payload.get("trainingStatusCode") is None:
+        if not payload:
+            return None
+        raw = payload.get("trainingStatusRaw")
+        if raw:
+            return raw
+        if payload.get("trainingStatusCode") is None:
             return None
         return {
             "trainingStatusCode": payload["trainingStatusCode"],
