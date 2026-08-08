@@ -507,21 +507,19 @@ keep just six normalized fields and discard the rest, which cost
 `hrvFactorPercent` among others; it now attaches the untouched source responses
 alongside them.
 
-> **Not yet in effect.** That ingestor change is committed but was not running
-> as of the 2026-08-08 deploy check: no file under
-> `raw/daily_training_state/` carried a raw block. The ingestor needs
-> deploying, after which only days written from then on gain the blocks. Until
-> a raw-carrying day exists *and* has aged past the 2-day training-state
-> freshness floor, both calls take the derived path below, and settled-date
-> HRV scores through `stored_history_approximate` rather than
-> `garmin_hrv_factor`. Confirm with:
->
-> ```bash
-> grep -l trainingReadinessRaw /data/garmin/raw/daily_training_state/*.json | head
-> ```
+Live since 2026-08-08, covering 2026-08-01 onward. The ingestor re-fetches a
+rolling window rather than only the current day, so its first run after
+deployment wrote the blocks for eight days at once — six of which were already
+past the 2-day training-state freshness floor, making the change usable the same
+evening. Check coverage at any time with:
 
-Historical days are not backfilled — re-fetching 730 days would cost one Garmin
-call each — so the derived form stays regardless.
+```bash
+grep -l trainingReadinessRaw /data/garmin/raw/daily_training_state/*.json | head
+```
+
+Days older than that first window keep the six-field record. They are not
+backfilled — re-fetching 730 days would cost one Garmin call each — so the
+derived form stays regardless.
 
 The tier is therefore decided per day, by what is actually on disk, not per
 method: a stored verbatim payload is exact and served regardless of
@@ -924,11 +922,6 @@ All three are catalogued in [TOOLS.md](TOOLS.md#known-broken-tools).
 
 **Depends on the ingestor (personal-ai), not actionable here**
 
-- **Deploy the ingestor's verbatim training-state change.** It is committed
-  there but was not running as of 2026-08-08, so no day yet carries
-  `trainingReadinessRaw` and cached dates cannot use Garmin's own HRV factor.
-  Nothing to change in this repo — the reader is already in place and will
-  pick the blocks up on their own.
 - `get_max_metrics` and `get_heart_rates` are genuinely uncollected and would
   need a new ingestion category, at API cost there.
 - `daily_wellness` is off by default, which blocks exact-tier `get_stats` and

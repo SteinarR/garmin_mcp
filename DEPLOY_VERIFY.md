@@ -101,9 +101,11 @@ A result that looks wrong is often just a date that is too recent:
 - Settled dates are servable once older than `GARMIN_CACHE_MIN_AGE_DAYS`
   (default 1).
 - **Training readiness and status use a stricter 2-day floor.** A day carrying
-  a newly-added field is not servable from cache until it has aged past it, so
-  a freshly deployed ingestor change takes a further two days to become
-  observable through the cache.
+  a newly-added field is not servable from cache until it has aged past it.
+  That does *not* mean a fresh ingestor change takes two days to observe: the
+  ingestor re-fetches a rolling window, so its first run after deployment
+  rewrites roughly a week of days at once, most of them already past the floor.
+  Check what the run actually wrote before concluding a change has not landed.
 - `get_stress_data` is never cached, for any date. It is why even a fully
   cached `get_readiness_breakdown` still costs one live call.
 
