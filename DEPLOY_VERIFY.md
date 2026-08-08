@@ -1,191 +1,124 @@
-# Deploy & verify prompt — garmin_mcp
+# Verifying a deploy
 
-Hand the block below to the agent that has server access.
+Standing rules for checking a `garmin_mcp` deploy on the server. Release-specific
+steps belong in the pull request being verified, not here — an earlier version of
+this file was a hand-off prompt for one release and was stale within days,
+pointing at a branch that no longer existed.
 
-**Budget note, corrected.** An earlier version of this file set a hard limit of
-3 live Garmin calls and then asked for a check that costs 5 on its own. That was
-contradictory, and the agent running it correctly stopped rather than overspend —
-which left the one check that actually mattered unrun. The budget below is
-**~8 live calls**, which is what verifying the live path genuinely costs. Most
-steps are free; the expensive ones are marked and justified.
+## The budget comes first
 
----
+Garmin rate-limits the whole account to roughly **90-100 calls per day**, shared
+with the garmin-ingestor. It is the binding constraint on everything this server
+does, and on how it gets tested.
+
+State a call budget before starting, and make it honest. The first version of
+this document set a hard cap of 3 live calls and then asked for a check costing
+5. The agent running it correctly refused — which meant the only check that
+exercised the actual defect never ran, and the release was reported as verified
+on the strength of checks that could not have failed.
+
+Rules that hold for any release:
+
+- **Never call a range tool to verify anything.** `get_trends`,
+  `detect_anomalies`, `get_period_summary`, `get_optimized_health_data` and
+  `get_coach_cues` cost 5-7 calls *per day of range*.
+- **Never call `get_sleep_data` through MCP.** ~280,000 characters, over the
+  result limit; it fails and wastes the call.
+- **Never retry a failed call.** Record the error and move on.
+- **Prefer a file or a log over a call**, always.
+- **Report the actual live-call count** at the end.
+
+## A cached date proves less than you think
+
+This is the trap that has caught two releases. The ingested-data cache serves
+settled dates from disk, and its payload shapes differ from live Garmin's. A
+defect in code that reads live payloads is *invisible* against a cached date —
+the cache happens to produce the key the broken code expected.
+
+So for anything touching payload parsing:
+
+- **A settled-date check confirms nothing regressed.** It does not confirm a
+  live-path fix works.
+- **`"today"` is the real test.** It is never served from cache, so every input
+  is live. It costs more, and it is the only thing that exercises the path.
+
+If the budget only allows one, make it `"today"`.
+
+## Zero-cost checks to run every time
+
+These need no Garmin calls and catch the failures that matter most.
+
+**The commit actually running.** Report it. Deploy the branch tip or the merge
+commit, not an intermediate one — a previous run pinned a mid-branch commit and
+missed later fixes.
+
+**The cache mount.** Look for either line at startup:
 
 ```
-Repo: SteinarR/garmin_mcp
-Deploy: the TIP of branch claude/registry-ajlab-uk-refs-35pnyn
-        (Deploy the tip, not a named commit. An earlier run pinned an
-        intermediate commit and missed later fixes.)
-
-GARMIN API BUDGET — READ FIRST
-Garmin rate-limits the whole account to roughly 90-100 calls per day, shared
-with the garmin-ingestor. This verification is budgeted at about 8 live calls.
-That is deliberate and sufficient; do not exceed it.
-
-  - Steps 1, 2, 3 and 6 cost ZERO live calls. Do those first.
-  - Step 4 costs ~1. Step 5 costs ~5. Both are justified below.
-  - Do NOT retry a failed call. Record the error and move on.
-  - Do NOT call any range tool (get_trends, detect_anomalies,
-    get_period_summary, get_optimized_health_data, get_coach_cues). They cost
-    5-7 calls PER DAY of range.
-  - Do NOT call get_sleep_data through MCP: ~280,000 characters, over the MCP
-    result limit. It will fail and waste the call.
-  - Prefer reading a file or a log over making a call, always.
-
-Report your actual live-call count at the end.
-
-WHAT CHANGED
-Three related defects, all the same shape: code read a key that does not exist
-in the payload Garmin actually returns, so a value silently became null while
-looking correct against cached data.
-
-  1. HRV. Live Garmin nests overnight HRV at hrvSummary.lastNightAvg; the code
-     read the flat avgHrv/average keys that only the ingested-data cache
-     produces. Affected get_readiness_breakdown, get_trends, detect_anomalies,
-     get_data_completeness, get_period_summary.
-  2. HRV scoring. A fixed 20-100 ms scale rated a 36 ms night 20/100 while
-     Garmin itself called it BALANCED / 96 GOOD. Now scored against the user's
-     own baseline, or Garmin's own hrvFactorPercent when available.
-  3. Body battery. get_body_battery returns one object PER DAY with readings in
-     bodyBatteryValuesArray; the code read bodyBatteryValue off the top-level
-     rows. Affected the same tools plus get_coach_cues and
-     get_training_and_diet_recommendations. Found by the previous verification
-     run, via the new components_missing field.
-
-Plus: the cache now warns when a read-only mount disables it, and the minimum
-Python is 3.12 (the runtime is already 3.12.13, so this is metadata catching up
-with reality — not a version change to the deployment).
-
-STEP 1 — DEPLOY (0 calls)
-Deploy the branch tip. Confirm the running container's commit before
-continuing, and report it. The build path is NOT docker.sh — that file was
-deleted; it pointed at the wrong registry. Note that if deploy.sh uses rsync
-without --delete, a stale docker.sh may still sit on the VPS; ignore it.
-
-STEP 2 — CACHE MOUNT, FROM LOGS (0 calls)
-Look for either line at startup:
-
-  Garmin cache enabled (dir=..., db=..., tiers=..., min_age_days=...)
-  [garmin-cache] WARNING: cannot open '<db>' ... directory is read-only
-
-The WARNING means the context-DB directory is mounted read-only, activity range
-caching is OFF, and every range query is burning the API budget. Fix: mount the
-directory holding the context DB READ-WRITE. The connection itself stays
-mode=ro, so the server still cannot write to it. GARMIN_CACHE_DIR stays :ro.
-
-Absence of the warning at startup proves nothing — it only fires on the first
-query that touches the DB. Step 3 triggers it.
-
-STEP 3 — EXERCISE THE CACHE (0 calls, with a preflight)
-The cache is fail-open: a DB error or a missing raw file falls back to live
-Garmin. So this is only free if you check first. Preflight, on the server, with
-no MCP involved:
-  - pick a 2-day range at least a week old
-  - confirm the SQLite rows exist for it AND that every referenced raw activity
-    file is present on disk
-
-Then call get_activities_by_date for exactly that range, and re-check the logs
-for the WARNING line. If it appears now, the mount is wrong: fix and redeploy.
-
-STEP 4 — get_hrv_data ON A SETTLED DATE (~1 call, likely 0)
-Pick ONE settled date at least 3 days old. Use the SAME date for steps 4 and 5.
-
-  get_hrv_data(<settled date>)
-
-Expect a JSON string and no error. This closes an open TOOLS.md note about a
-Pydantic "Input should be a valid string" error reported long ago. Code
-inspection says it cannot happen anymore. One clean call settles it — do not
-retry it even though the original report described the error as intermittent.
-
-STEP 5 — READINESS, SETTLED THEN TODAY (~5 calls)
-Read this before running: the settled-date call is NOT a test of the HRV fix.
-On a cached date, HRV arrives as flat avgHrv — the exact key the OLD broken
-code read successfully. A settled date passing proves only that nothing
-regressed. The bug was live-path-only, so "today" is the real test.
-
-  5a. get_readiness_breakdown(<same settled date>)   ~1 call
-      (Most inputs come off disk; get_stress_data is never cached, so it makes
-      the one live request.)
-      Check:
-        components.hrv_score          not null
-        components.body_battery_score not null   <-- the new fix; was null here
-                                                     in the previous run
-        components_missing            should be empty, or explain what is in it
-        hrv_scoring_method            expect population_scale_approximate on a
-                                      cached date, since the cache stores no
-                                      HRV baseline
-        garmin_training_readiness     Garmin's own score, for comparison
-
-  5b. get_readiness_breakdown("today")               ~5 calls
-      THIS IS THE ONE THAT MATTERS. Today is never served from cache, so all
-      five inputs are live: sleep, body battery, training readiness, HRV,
-      stress. That is what the 5 calls buy, and it is the only way to exercise
-      the path that was broken.
-      Check:
-        components.hrv_score          not null  <-- was null on EVERY live call
-        components.body_battery_score not null
-        hrv_scoring_method            expect garmin_hrv_factor or
-                                      personal_baseline here, NOT
-                                      population_scale_approximate. If it is
-                                      the population scale, the live payload
-                                      carries no baseline and no Garmin factor
-                                      — report that, it is useful.
-        hrv_ms                        not null
-      If 5a passes and 5b fails, the live payload shape differs from what the
-      fix expects. Capture the raw shape from the logs — do NOT make another
-      call — and report the top-level keys.
-
-STEP 6 — DOES raw/stats ALREADY CONTAIN STRESS? (0 calls)
-get_stress_data is never cached, for any date, because the ingestor does not
-collect it. It is why step 5a costs a live call at all. But the ingestor DOES
-store the daily stats payload verbatim, and Garmin's daily summary usually
-carries an average stress field. If it is there, a derived stress tier is
-possible with no new ingestion and no extra API cost anywhere — which would
-take a settled-date readiness call from 1 live call to 0.
-
-Just read a file already on disk:
-
-  python3 -c "import json; d=json.load(open('/data/garmin/raw/stats/<settled date>.json')); print(sorted(k for k in d if 'stress' in k.lower()))"
-
-Report the exact key names found (expect something like averageStressLevel,
-maxStressLevel, stressDuration), or an empty list. Also print the value of the
-average field if present. Do NOT call get_stress_data to compare — that costs a
-call and the comparison can wait.
-
-REPORT BACK
-  1. Commit deployed (and confirm it is the branch tip).
-  2. WARNING line present or absent, before and after step 3.
-  3. Step 4: clean or not. Either way the TOOLS.md note can be closed.
-  4. Steps 5a and 5b: hrv_score, body_battery_score, hrv_ms,
-     hrv_scoring_method, components_used, components_missing,
-     garmin_training_readiness.
-  5. Step 6: the stress-related keys found in raw/stats, and the average value.
-  6. Your actual live Garmin call count.
+Garmin cache enabled (dir=..., db=..., tiers=..., min_age_days=...)
+[garmin-cache] WARNING: cannot open '<db>' ... directory is read-only
 ```
 
----
+The warning means the context-DB directory is mounted read-only, activity range
+caching is off, and every range query is spending budget. Fix: mount the
+directory holding the context DB **read-write**. The connection itself stays
+`mode=ro`, so the server still cannot write to the database; `GARMIN_CACHE_DIR`
+stays `:ro`.
 
-## Why the budget is 8 and not 3
+Absence of the warning at startup proves nothing — it fires on the first query
+that touches the DB. Trigger it deliberately.
 
-There is no cheap way to test the live path. One `get_readiness_breakdown` on an
-uncached date fans out to five client calls — sleep, body battery, training
-readiness, HRV, stress — and the cache deliberately bypasses the first four for
-recent dates because Garmin keeps revising them. Stress is never cached at all.
+**The lockfile.** Compare `/app/uv.lock` in the container against the committed
+one. They must be byte-identical. A `uv` older than lockfile `revision` support
+silently rewrites it during `uv sync --frozen`, which means the built image does
+not match the lock.
 
-The previous run stayed inside a 3-call budget and passed every check it ran,
-but every one of those checks hit the cache, where the bug never showed. The
-settled-date result (`hrv_scoring_method: population_scale_approximate`, source
-`garmin-ingestor-cache`) would have looked identical before the fix.
+**What the ingestor is actually writing.** Reading a stored payload costs
+nothing and answers questions no API call can:
 
-## What the previous run got right
+```bash
+python3 -c "import json;d=json.load(open('/data/garmin/raw/stats/<date>.json'));print(sorted(d))"
+grep -l trainingReadinessRaw /data/garmin/raw/daily_training_state/*.json | head
+```
 
-Two prompt errors it correctly caught, both fixed above:
+Remember that an ingestor change only takes effect for payloads written **after
+that service is redeployed**, and only for days written from then on. A
+committed change is not a live one.
 
-- **Step 3 is not unconditionally free.** The cache falls back to live Garmin on
-  a DB error or a missing raw file. It now carries an explicit preflight.
-- **Pin the tip, not a commit.** The previous run deployed the last code commit
-  and missed a later one.
+## Exercising the cache is not free by default
 
-It also found the body battery bug, which no test caught because the test
-fixture had been written from the consuming code rather than from a real
-payload.
+The cache is **fail-open**: a DB error or a missing raw file falls back to the
+live API. So a "cached" call is only zero-cost if you check first.
+
+Before calling `get_activities_by_date` on a settled range, confirm on the
+server that the SQLite rows exist for it *and* that every referenced raw
+activity file is present. Then call it, then re-check the logs for the warning.
+
+## Freshness floors, when reading results
+
+A result that looks wrong is often just a date that is too recent:
+
+- Settled dates are servable once older than `GARMIN_CACHE_MIN_AGE_DAYS`
+  (default 1).
+- **Training readiness and status use a stricter 2-day floor.** A day carrying
+  a newly-added field is not servable from cache until it has aged past it, so
+  a freshly deployed ingestor change takes a further two days to become
+  observable through the cache.
+- `get_stress_data` is never cached, for any date. It is why even a fully
+  cached `get_readiness_breakdown` still costs one live call.
+
+## Reading `get_readiness_breakdown`
+
+The most informative single call, and the one worth spending budget on. Check:
+
+- `components_missing` — empty is the goal. A named component here is a real
+  finding; this field is what surfaced the body-battery defect in production.
+- `hrv_scoring_method` — must be consistent with what is on disk. On `"today"`
+  expect `garmin_hrv_factor`. On a settled date expect
+  `stored_history_approximate` unless that day carries a raw training-readiness
+  block, in which case expect `garmin_hrv_factor` there too.
+  `population_scale_approximate` means neither was available — report it, it is
+  informative rather than wrong.
+- `hrv_baseline_samples` — how many nights backed a history-derived score.
+- `garmin_training_readiness` — Garmin's own score, for comparison with the
+  composite.

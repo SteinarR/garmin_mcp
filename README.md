@@ -501,13 +501,29 @@ Garmin returned, so tools cannot tell the difference:
 category (`GARMIN_ENABLE_DAILY_WELLNESS=true`), which is off by default there.
 Only the single-day `get_body_battery` form is cached; wider ranges stay live.
 
-The two training-state calls are exact **only for days written since the
-ingestor started attaching the raw responses (2026-08-07)**. It used to keep
-just six normalized fields and discard the rest, which cost `hrvFactorPercent`
-among others. Earlier days are not backfilled — re-fetching 730 days would cost
-one Garmin call each — so they fall back to the derived form below.
+The two training-state calls are exact **only for days whose stored payload
+carries `trainingReadinessRaw` / `trainingStatusRaw`**. The ingestor used to
+keep just six normalized fields and discard the rest, which cost
+`hrvFactorPercent` among others; it now attaches the untouched source responses
+alongside them.
 
-Their tier is therefore decided per day, by what is actually on disk, not per
+> **Not yet in effect.** That ingestor change is committed but was not running
+> as of the 2026-08-08 deploy check: no file under
+> `raw/daily_training_state/` carried a raw block. The ingestor needs
+> deploying, after which only days written from then on gain the blocks. Until
+> a raw-carrying day exists *and* has aged past the 2-day training-state
+> freshness floor, both calls take the derived path below, and settled-date
+> HRV scores through `stored_history_approximate` rather than
+> `garmin_hrv_factor`. Confirm with:
+>
+> ```bash
+> grep -l trainingReadinessRaw /data/garmin/raw/daily_training_state/*.json | head
+> ```
+
+Historical days are not backfilled — re-fetching 730 days would cost one Garmin
+call each — so the derived form stays regardless.
+
+The tier is therefore decided per day, by what is actually on disk, not per
 method: a stored verbatim payload is exact and served regardless of
 `GARMIN_CACHE_DERIVED`, while the normalized reconstruction honours that flag
 like everything else in the derived tier.
@@ -519,8 +535,8 @@ response carries only the retained fields and is tagged `"_partial": true`:
 |------|--------|----------|
 | `get_rhr_day(date)` | raw sleep | `restingHeartRate` |
 | `get_hrv_data(date)` | raw sleep | `avgOvernightHrv`, `hrvStatus`, `hrvData` |
-| `get_training_readiness(date)` | `raw/daily_training_state/` | readiness score — pre-2026-08-07 days only, see above |
-| `get_training_status(date)` | `raw/daily_training_state/` | status code, acute/chronic load — pre-2026-08-07 days only |
+| `get_training_readiness(date)` | `raw/daily_training_state/` | readiness score — days without a raw block, see above |
+| `get_training_status(date)` | `raw/daily_training_state/` | status code, acute/chronic load — days without a raw block |
 | `get_body_composition(date)` | `raw/body_metrics/` | weight, muscle mass, body fat |
 
 Everything else — `get_stress_data`, `get_max_metrics`, `get_heart_rates`,
@@ -908,13 +924,18 @@ All three are catalogued in [TOOLS.md](TOOLS.md#known-broken-tools).
 
 **Depends on the ingestor (personal-ai), not actionable here**
 
+- **Deploy the ingestor's verbatim training-state change.** It is committed
+  there but was not running as of 2026-08-08, so no day yet carries
+  `trainingReadinessRaw` and cached dates cannot use Garmin's own HRV factor.
+  Nothing to change in this repo — the reader is already in place and will
+  pick the blocks up on their own.
 - `get_max_metrics` and `get_heart_rates` are genuinely uncollected and would
   need a new ingestion category, at API cost there.
 - `daily_wellness` is off by default, which blocks exact-tier `get_stats` and
   `get_body_battery`.
 - Only single-day `get_body_battery` is cached; wider ranges stay live.
-- Historical days keep the pre-2026-08-07 six-field training-state record and
-  are deliberately not backfilled.
+- Days written before that ingestor change keep the six-field training-state
+  record and are deliberately not backfilled.
 
 ## License
 

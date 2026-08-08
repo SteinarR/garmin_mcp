@@ -219,12 +219,30 @@ ingestor stores no HRV endpoint response for one to come from, so
 fixed scale rated a 40 ms night **40/100** where Garmin's own factor said
 **94**; percentile bands over the same user's 60-day history score it **91**.
 
-Since 2026-08-07 the ingestor also attaches `trainingReadinessRaw` — the
-untouched readiness response, `hrvFactorPercent` included — alongside the six
-normalised fields it already wrote. `cache.get_training_readiness` serves that
-verbatim when present, so **cached dates now reach `garmin_hrv_factor` too**,
-with no live call. Days written before that change are not backfilled and still
-rely on the history tier, which is why both remain.
+Measured again on the 2026-08-08 deploy, on real data rather than a fixture:
+
+| Date | HRV | Method | Score |
+|---|---|---|---|
+| 2026-08-05 | 35 ms | `stored_history_approximate` (60 nights) | 93.41 |
+| 2026-08-08 | 36 ms | `garmin_hrv_factor` | 92.0 |
+
+Adjacent nights 1 ms apart, scored by two independent models, landing 1.4
+points apart. That is one validation point, not a validated model — but it is
+the first evidence from real data that the percentile bands track Garmin's own
+assessment for this user.
+
+The ingestor has a change to also attach `trainingReadinessRaw` — the untouched
+readiness response, `hrvFactorPercent` included — alongside the six normalised
+fields it already writes. `cache.get_training_readiness` serves that verbatim
+when present, which would let **cached dates reach `garmin_hrv_factor` with no
+live call**.
+
+**That change is not live yet.** As of the 2026-08-08 deploy check, no file
+under `raw/daily_training_state/` carried a raw block: the change is committed
+in personal-ai but the ingestor has not been redeployed. Nothing is needed in
+this repo — the reader is in place and will pick the blocks up when they
+appear. Until then, and for every day written before the change, settled dates
+score through the history tier, which is why both remain.
 
 `hrv_history` reads disk and never the live client. Scoring will only call it on
 a client that publishes `hrv_history_source = DISK_BACKED_HISTORY`, a private
