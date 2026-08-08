@@ -725,3 +725,58 @@ def test_range_tools_read_every_readiness_shape(tools, payload):
         "get_period_summary", Readiness(), "daily", RANGE_START, True, True, True, True, True, True
     )
     assert result["aggregates"]["avg_training_readiness"] == 55.0
+
+
+def _band(**kwargs):
+    return _extract_hrv_baseline({"hrvSummary": {"baseline": kwargs}})
+
+
+def test_missing_low_upper_band_is_still_accepted():
+    """Garmin omitting lowUpper is a usable band, not a malformed one.
+
+    Rejecting it would drop a real personal baseline down to a weaker tier.
+    """
+    assert _band(balancedLow=36, balancedUpper=55) == {
+        "low_upper": 36.0,
+        "balanced_low": 36.0,
+        "balanced_upper": 55.0,
+    }
+
+
+def test_missing_low_upper_scores_continuously():
+    """PR #4 re-review, P3: 35.999ms scored 40 and 36.000ms scored 60.
+
+    A fifth of the HRV component, and five points of the composite, decided by
+    a rounding difference.
+    """
+    baseline = _band(balancedLow=36, balancedUpper=55)
+    below = _score_hrv_against_baseline(35.999, baseline)
+    at = _score_hrv_against_baseline(36.0, baseline)
+    assert at == 60.0
+    assert abs(at - below) < 0.5
+
+
+def test_present_low_upper_still_scores_continuously():
+    baseline = _band(lowUpper=32, balancedLow=36, balancedUpper=55)
+    for boundary in (32.0, 36.0, 55.0):
+        below = _score_hrv_against_baseline(boundary - 0.001, baseline)
+        at = _score_hrv_against_baseline(boundary, baseline)
+        assert abs(at - below) < 0.5, f"discontinuity at {boundary}"
+
+
+@pytest.mark.parametrize(
+    "baseline_kwargs",
+    [
+        {"balancedLow": 36, "balancedUpper": 55},
+        {"lowUpper": 32, "balancedLow": 36, "balancedUpper": 55},
+        {"lowUpper": 2, "balancedLow": 3, "balancedUpper": 6},
+    ],
+    ids=["no_low_upper", "full_band", "small_values"],
+)
+def test_scoring_curve_is_monotonic_and_bounded(baseline_kwargs):
+    """Small values matter: the sub-balanced ramp inverts if the floor rises above it."""
+    baseline = _band(**baseline_kwargs)
+    assert baseline is not None
+    scores = [_score_hrv_against_baseline(v / 100, baseline) for v in range(10, 9000)]
+    assert scores == sorted(scores)
+    assert all(0.0 <= s <= 100.0 for s in scores)

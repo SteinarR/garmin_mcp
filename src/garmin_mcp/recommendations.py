@@ -404,13 +404,23 @@ def _score_hrv_against_baseline(value: float, baseline: Dict[str, float]) -> flo
     if value >= balanced_low:
         span = balanced_upper - balanced_low
         return round(60.0 + 30.0 * (value - balanced_low) / span, 2)
-    if value >= low_upper and balanced_low > low_upper:
-        span = balanced_low - low_upper
-        return round(40.0 + 20.0 * (value - low_upper) / span, 2)
-    floor = max(low_upper * 0.6, 1.0)
+
+    # Below the balanced band. Keep the floor under balanced_low even for a
+    # band whose numbers are small, or the ramp below inverts.
+    floor = min(max(low_upper * 0.6, 1.0), balanced_low * 0.9)
     if value <= floor:
         return 0.0
-    return round(40.0 * (value - floor) / (low_upper - floor), 2)
+    if balanced_low > low_upper:
+        # Garmin gave a distinct low zone: floor->low_upper covers 0-40, and
+        # low_upper->balanced_low covers 40-60.
+        if value >= low_upper:
+            return round(40.0 + 20.0 * (value - low_upper) / (balanced_low - low_upper), 2)
+        return round(40.0 * (value - floor) / (low_upper - floor), 2)
+    # No distinct low zone — Garmin omitted `lowUpper`, so it was substituted
+    # with balanced_low. Ramp straight to 60 across the whole sub-balanced
+    # region. Stopping at 40 here would jump 20 points at balanced_low, which
+    # is a fifth of the HRV component decided by a rounding difference.
+    return round(60.0 * (value - floor) / (balanced_low - floor), 2)
 
 
 def _garmin_hrv_factor(readiness: Any) -> Optional[float]:
