@@ -12,6 +12,7 @@ dependencies = [
     "python-dotenv==1.0.1",
     "garminconnect==0.2.25",
     "requests==2.32.3",
+    "certifi>=2026.10.23",
     "mcp>=1.4.0,<2.0.0",
     "garth==0.5.2",
 ]
